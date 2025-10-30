@@ -1,111 +1,129 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import rospy
-
-import time
 import base64
 import socket
 
+import rclpy
+from rclpy.node import Node
 from nmea_msgs.msg import Sentence
 from std_msgs.msg import String
 
 
-# init ---------------------------------
-rospy.init_node('ichimill_connect')
+class IchimillConnectNode(Node):
+    def __init__(self):
+        super().__init__('ichimill_connect')
 
-pub = rospy.Publisher('/softbank/rtcm_data', String, queue_size=10)
-tcpip = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # パラメータの宣言と取得
+        self.declare_parameter('debug', False)
+        self.declare_parameter('username', '')
+        self.declare_parameter('password', '')
+        self.declare_parameter('port', 2101)
+        self.declare_parameter('host', "ntrip.ales-corp.co.jp")
+        self.declare_parameter('mountpoint', "32M7NHS")
 
-debug = rospy.get_param('~debug', False)
+        self.debug = self.get_parameter('debug').get_parameter_value().bool_value
+        self.username = self.get_parameter('username').get_parameter_value().string_value
+        self.password = self.get_parameter('password').get_parameter_value().string_value
+        self.port = self.get_parameter('port').get_parameter_value().integer_value
+        self.host_url = self.get_parameter('host').get_parameter_value().string_value
+        self.mountpoint = self.get_parameter('mountpoint').get_parameter_value().string_value
 
-username = rospy.get_param('~username', '')
-password = rospy.get_param('~password', '')
-port = rospy.get_param('~port', 2101)
+        # Publisher, Subscriber, Socketの初期化
+        self.pub = self.create_publisher(String, '/softbank/rtcm_data', 10)
+        self.tcpip = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcpip.settimeout(10.0)
 
-host_url = rospy.get_param('~host', "ntrip.ales-corp.co.jp")
-mountpoint = rospy.get_param('~mountpoint', "32M7NHS")
+        self.mutex_server = False
 
-mutex_server = False
+    def connect_to_caster(self):
+        pwd = base64.b64encode(f"{self.username}:{self.password}".encode('ascii')).decode('ascii')
+        header = (
+            f"GET /{self.mountpoint} HTTP/1.1\r\n"
+            f"Authorization: Basic {pwd}\r\n"
+            "User-Agent: NTRIP ROS2Client/1.0\r\n"
+            "Connection: close\r\n\r\n"
+        )
 
-def cb_GGA(data):
-	global tcpip
-	global pub
-	global debug
-	global host_url
-	global mutex_server
-	sendData = data.sentence
+        try:
+            self.get_logger().info(f"NTRIP Caster connecting to {self.host_url}:{self.port}...")
+            self.tcpip.connect((self.host_url, self.port))
+            self.get_logger().info("OK")
 
-	if( sendData.split(',').count('') > 1 ):
-		# 必要なデータが欠けている
-		rospy.logwarn("Missing the necessary elements GGA sentence:" + sendData)
-		return
+            self.get_logger().info("Header sending...")
+            self.tcpip.send(header.encode('ascii'))
 
-	if debug:
-		rospy.loginfo("Send ichimill server :" + sendData)
+            data = self.tcpip.recv(1024).decode('ascii')
+            self.get_logger().info(f"Caster Response: {data.strip()}")
+            if "ICY 200 OK" in data:
+                self.subscription = self.create_subscription(Sentence, "/nmea_gga", self.cb_gga, 10)
+                return True
+            else:
+                self.get_logger().error(f"Caster ResponseError!! : {data}")
+                return False
+        except socket.error as ex:
+            self.get_logger().error(f"NTRIP Caster connect error: {ex}")
+            return False
+        except Exception as ex:
+            self.get_logger().error(f"Exception error during connection: {ex}")
+            return False
 
-	if mutex_server:
-		# サーバ待ち状態なのでリクエストしない
-		return
+    def cb_gga(self, data):
+        send_data = data.sentence
 
-	mutex_server = True
-	try:
-		tcpip.send(sendData)
-		sendTime = rospy.Time.now()
+        if send_data.split(',').count('') > 1:
+            self.get_logger().warn(f"Missing the necessary elements in GGA sentence: {send_data}")
+            return
 
-		time.sleep(0.25) # 250 msec
+        if self.debug:
+            self.get_logger().info(f"Sending to ichimill server: {send_data}")
 
-		rtk_datas = tcpip.recv(4096)
-		if debug:
-			rospy.loginfo( "NTRIP data receive:" + str(len(rtk_datas)) )
+        if self.mutex_server:
+            return
 
-		responceDelay = (rospy.Time.now() - sendTime)
-		if  responceDelay > rospy.Duration(3.0):
-			rospy.logwarn( "NTRIP Caster Responce　Delay 3.0Sec Over! : " + str(responceDelay) + "nsec / host:" + host_url )
+        self.mutex_server = True
+        try:
+            self.tcpip.send(send_data.encode('ascii'))
+            send_time = self.get_clock().now()
 
-		pub.publish(rtk_datas)
+            rtk_datas_bytes = self.tcpip.recv(4096)
+            if self.debug:
+                self.get_logger().info(f"NTRIP data received: {len(rtk_datas_bytes)} bytes")
 
-	except socket.timeout as ex:
-		rospy.logwarn( "NTRIP Caster  timeout")
-	except Exception as ex:
-		rospy.logerr( "exception error : " + ex)
-	finally:
-		mutex_server = False
+            response_delay = self.get_clock().now() - send_time
+            if response_delay.nanoseconds > 3.0 * 1e9:
+                self.get_logger().warn(f"NTRIP Caster Response Delay > 3.0s: {response_delay.nanoseconds} nsec on host: {self.host_url}")
+
+            if rtk_datas_bytes:
+                msg = String()
+                # RTCMデータはバイナリなので、そのままstringに格納するのはベストではないが、
+                # ROS1の挙動を維持するため、受信したbytesをそのままstringとして扱う
+                msg.data = rtk_datas_bytes.decode('latin-1') # エラーを起こさずにbytesをstringに変換
+                self.pub.publish(msg)
+
+        except socket.timeout:
+            self.get_logger().warn("NTRIP Caster timeout.")
+        except Exception as ex:
+            self.get_logger().error(f"Exception error: {ex}")
+        finally:
+            self.mutex_server = False
+
+    def shutdown(self):
+        self.tcpip.close()
+        self.get_logger().info("NTRIP Caster disconnected")
 
 
-# Main
+def main(args=None):
+    rclpy.init(args=args)
+    node = IchimillConnectNode()
+    if node.connect_to_caster():
+        try:
+            rclpy.spin(node)
+        except KeyboardInterrupt:
+            pass
+    node.shutdown()
+    node.destroy_node()
+    rclpy.shutdown()
+
 if __name__ == '__main__':
-	pwd = base64.b64encode("{}:{}".format(username, password).encode('ascii')).decode('ascii')
-
-	header =\
-		"GET /" + mountpoint +" HTTP/1.1\r\n" +\
-		"Authorization: Basic {}\r\n\r\n".format(pwd)
-
-
-	try:
-		rospy.loginfo("NTRIP Caster connecting...")
-		tcpip.connect((host_url,int(port)))
-		rospy.loginfo("ok")
-
-		rospy.loginfo("Header sending...")
-		tcpip.send(header.encode('ascii'))
-
-		data = tcpip.recv(1024).decode('ascii')
-		print(data)
-		if( data.strip() == "ICY 200 OK" ):
-			rospy.Subscriber("/nmea_gga", Sentence, cb_GGA)
-			rospy.spin()
-		else:
-			rospy.logerr("Caster ResponseError!! : " + data)
-
-	except socket.error as ex:
-		rospy.logerr( "NTRIP Caster connect error({0}): {1}".format(ex.errno, ex.strerror))
-	except Exception as ex:
-		rospy.logerr( "exception error : " + ex)
-	except rospy.ROSInterruptException:
-		pass
-	finally:
-		tcpip.close() # close tcpip
-		rospy.loginfo("NTRIP Caster disconnect")
-
-
+    main()

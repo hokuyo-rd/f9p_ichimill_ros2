@@ -1,108 +1,124 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import rospy
-
-import base64
-import socket
 import serial
 
+import rclpy
+from rclpy.node import Node
 from nmea_msgs.msg import Sentence
 from std_msgs.msg import String
 
 
 def calcultateCheckSum(stringToCheck):
-	xsum_calc = 0
-	for char in stringToCheck:
-		xsum_calc = xsum_calc ^ ord(char)
-	return "%02X" % xsum_calc
+    xsum_calc = 0
+    for char in stringToCheck:
+        xsum_calc = xsum_calc ^ ord(char)
+    return "%02X" % xsum_calc
 
 
-# init ---------------------------------
-rospy.init_node('f9p_driver')
+class F9PDriverNode(Node):
+    def __init__(self):
+        super().__init__('f9p_driver')
 
-serial_port = rospy.get_param('~port', '/dev/ttyACM0')
-serial_baud = rospy.get_param('~baud', 230400)
+        # パラメータの宣言と取得
+        self.declare_parameter('port', '/dev/ttyACM0')
+        self.declare_parameter('baud', 230400)
+        self.declare_parameter('debug', False)
 
-debug = rospy.get_param('~debug', False)
+        self.serial_port = self.get_parameter('port').get_parameter_value().string_value
+        self.serial_baud = self.get_parameter('baud').get_parameter_value().integer_value
+        self.debug = self.get_parameter('debug').get_parameter_value().bool_value
 
-seqGGA = 0
-pubGGA = rospy.Publisher('nmea_gga', Sentence, queue_size=60)
-seqNmeaSeq = 0
-pubNmea = rospy.Publisher('nmea_sentence', Sentence, queue_size=60)
+        # Publisher, Subscriberの初期化
+        self.pub_gga = self.create_publisher(Sentence, 'nmea_gga', 10)
+        self.pub_nmea = self.create_publisher(Sentence, 'nmea_sentence', 10)
+        self.subscription = self.create_subscription(String, "/softbank/rtcm_data", self.cb_rtcm_data, 10)
 
-#print("Header sending... \n")
-rtcmData = ""
+        self.seq_gga = 0
+        self.seq_nmea = 0
+        self.rtcm_data = b""
 
-def cb_RtcmData(data):
-	global rtcmData
-	rtcmData = data.data
+    def cb_rtcm_data(self, msg):
+        # ROS 2のichimill_connect.pyはlatin-1でエンコードしているため、
+        # それに合わせてデコードしてbytesに戻す
+        self.rtcm_data = msg.data.encode('latin-1')
 
+    def run(self):
+        try:
+            self.get_logger().info("Serial port opening...")
+            gps_serial = serial.Serial(port=self.serial_port, baudrate=self.serial_baud, timeout=2)
+            self.get_logger().info(f"OK. Port: {self.serial_port}, Baudrate: {self.serial_baud}")
 
-# Main
+            try:
+                while rclpy.ok():
+                    try:
+                        gps_line = gps_serial.readline()
+                        gps_str = gps_line.decode('ascii').strip()
+                    except (UnicodeDecodeError, serial.SerialException):
+                        # デコードエラーやシリアルエラーは無視して次の行を読む
+                        continue
+
+                    if not gps_str:
+                        continue
+
+                    if self.debug:
+                        self.get_logger().info(f"Received: {gps_str}")
+
+                    # GGAセンテンスの処理と発行
+                    if "GGA" in gps_str:
+                        send_data = gps_str
+                        if "$GNGGA" in gps_str:
+                            # チェックサム再計算
+                            gga_string = gps_str.replace('$GNGGA', 'GPGGA')
+                            if '*' in gga_string:
+                                gga_string = gga_string.split('*')[0]
+                            checksum = calcultateCheckSum(gga_string[1:]) # $を除いて計算
+                            send_data = f"{gga_string}*{checksum}\r\n"
+
+                        gga_sentence = Sentence()
+                        gga_sentence.header.stamp = self.get_clock().now().to_msg()
+                        gga_sentence.header.frame_id = 'gps'
+                        # seqはROS 2では非推奨だが、互換性のために残す
+                        # gga_sentence.header.seq = self.seq_gga
+                        gga_sentence.sentence = send_data
+                        self.pub_gga.publish(gga_sentence)
+                        self.seq_gga += 1
+
+                    # 全てのNMEAセンテンスを発行
+                    nmea_sentence = Sentence()
+                    nmea_sentence.header.stamp = self.get_clock().now().to_msg()
+                    nmea_sentence.header.frame_id = 'gps'
+                    # nmea_sentence.header.seq = self.seq_nmea
+                    nmea_sentence.sentence = gps_str
+                    self.pub_nmea.publish(nmea_sentence)
+                    self.seq_nmea += 1
+
+                    # Ntrip CasterからのRTCMデータをF9Pに送信
+                    if len(self.rtcm_data) > 0:
+                        gps_serial.write(self.rtcm_data)
+                        if self.debug:
+                            self.get_logger().info(f"Wrote {len(self.rtcm_data)} bytes of RTCM data to F9P.")
+                        self.rtcm_data = b""
+
+            except serial.SerialException as ex:
+                self.get_logger().error(f"SerialException error: {ex}")
+            finally:
+                gps_serial.close()
+                self.get_logger().info("Serial port closed.")
+
+        except serial.SerialException as ex:
+            self.get_logger().error(f"Could not open serial port: {ex}")
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = F9PDriverNode()
+    try:
+        node.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
 if __name__ == '__main__':
-
-	rospy.Subscriber("/softbank/rtcm_data", String, cb_RtcmData)
-	try:
-		rospy.loginfo("serial port Open...")
-		GPS = serial.Serial(port=serial_port, baudrate=serial_baud, timeout=2)
-
-		rospy.loginfo("Ok")
-		gps_str_nmea = []
-
-		try:
-			while not rospy.is_shutdown():
-				gps_datas = GPS.readline().split()
-				for gps_data in gps_datas:
-					gps_str = ""
-					try:
-						gps_str = gps_data.decode('ascii')
-						if debug:
-							rospy.loginfo(gps_str)
-					except UnicodeError:
-						pass
-					
-					# GGA Sentence publish
-					if "GGA" in gps_str:
-						if "$GNGGA" in gps_str:
-							ggaString = gps_str.replace('$GNGGA', 'GPGGA')
-							ggaString = ggaString[:-3]
-							checksum = calcultateCheckSum(ggaString)
-							sendData = bytes(("$%s*%s\r\n" % (ggaString, checksum)).encode('ascii'))
-						else:
-							sendData = gps_str
-
-						ggaSentence = Sentence()
-						ggaSentence.header.stamp = rospy.get_rostime()
-						ggaSentence.header.frame_id = 'gps'
-						ggaSentence.header.seq = seqGGA
-						ggaSentence.sentence = sendData
-						pubGGA.publish(ggaSentence)
-						seqGGA = seqGGA + 1
-
-						ggaSentence = Sentence()
-						ggaSentence.header.stamp = rospy.get_rostime()
-						ggaSentence.header.frame_id = 'gps'
-						ggaSentence.header.seq = seqNmeaSeq
-						ggaSentence.sentence = gps_str
-						pubNmea.publish(ggaSentence)
-						seqNmeaSeq = seqNmeaSeq + 1
-				
-				# nstrip casterからのデータを受信していれば、レシーバーに送信 
-				if len(rtcmData) > 0:
-					GPS.write(rtcmData)
-					rtcmData = ""
-				
-				#rospy.Rate(10).sleep()
-				rospy.sleep(0)
-
-		except serial.SerialException as ex:
-			rospy.logerr( "SerialException error({0}): {1}".format(ex.errno, ex.strerror))
-		except rospy.ROSInterruptException:
-			pass
-		finally:
-			GPS.close()  # Close GPS serial port
-			rospy.loginfo("serial port Closed.")
-
-	except serial.SerialException as ex:
-		rospy.logerr( "SerialException port open error({0}): {1}".format(ex.errno, ex.strerror))
+    main()

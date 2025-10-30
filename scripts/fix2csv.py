@@ -1,53 +1,72 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import rospy
-
-import roslib.packages
 import os
-
 from datetime import datetime
+import rclpy
+from rclpy.node import Node
+from rclpy.time import Time
+from ament_index_python.packages import get_package_share_directory
 from sensor_msgs.msg import NavSatFix
 
-seq=0
-default_stamp_delay = 1.0
+class Fix2CsvNode(Node):
+    def __init__(self):
+        super().__init__('fix2csv')
 
-homeDir = roslib.packages.get_pkg_dir('f9p_ichimill')
-if homeDir is None or len(homeDir) == 0:
-	homeDir = os.environ['HOME']
+        # パラメータの宣言と取得
+        self.declare_parameter('delay', 1.0)
+        self.stamp_delay = self.get_parameter('delay').get_parameter_value().double_value
 
-fname = homeDir + "/fix{0:%Y%m%d_%H%M}.csv".format(datetime.now())
-f = open( fname, "w" )
+        # ファイルの準備
+        try:
+            share_dir = get_package_share_directory('f9p_ichimill')
+        except Exception:
+            share_dir = os.path.join(os.environ['HOME'], 'ros2_ws', 'src', 'f9p_ichimill')
+            os.makedirs(share_dir, exist_ok=True)
 
-old_time = rospy.Time.from_sec(0.0)
+        self.fname = os.path.join(share_dir, f"fix_{datetime.now():%Y%m%d_%H%M}.csv")
+        self.file = open(self.fname, "w")
+        self.get_logger().info(f"Start GPS /fix topic to csv file: {self.fname}")
+        self.get_logger().info(f"  delay = {self.stamp_delay:.2f} sec")
 
-def cb_fix(dt):
-	global seq
-	global f
-	global old_time
-	global stamp_delay
+        # 変数の初期化
+        self.seq = 0
+        self.old_time = Time(seconds=0, nanoseconds=0, clock_type=self.get_clock().clock_type)
 
-	# 時間経過またはステータス変化 
-	if ( (dt.header.stamp - old_time).to_sec() > stamp_delay ):
-		seq = seq + 1
-		logtime = datetime.fromtimestamp(dt.header.stamp.to_time())
-		linestr = str(seq) + "," + str(dt.latitude) + "," + str(dt.longitude) + ",status=" + str(dt.status.status) + ",service=" + str(dt.status.service) + ",stamp=" + str(logtime) + "\n"
-		f.write( linestr )
-		old_time = dt.header.stamp
+        # Subscriberの作成
+        self.subscription = self.create_subscription(NavSatFix, '/fix', self.cb_fix, 10)
 
-rospy.init_node("fix2csv")
+    def cb_fix(self, msg):
+        current_time = Time.from_msg(msg.header.stamp)
+        
+        # 設定した遅延時間以上経過しているかチェック
+        if (current_time - self.old_time).nanoseconds / 1e9 > self.stamp_delay:
+            self.seq += 1
+            log_time = datetime.fromtimestamp(current_time.seconds_nanoseconds()[0])
+            line_str = (
+                f"{self.seq},{msg.latitude},{msg.longitude},"
+                f"status={msg.status.status},service={msg.status.service},"
+                f"stamp={log_time}\n"
+            )
+            self.file.write(line_str)
+            self.old_time = current_time
 
-stamp_delay = rospy.get_param('~delay', default_stamp_delay)
+    def on_shutdown(self):
+        if self.file:
+            self.file.close()
+            self.get_logger().info(f"Closed {self.fname}")
 
-subJyr = rospy.Subscriber('/fix', NavSatFix, cb_fix)
+def main(args=None):
+    rclpy.init(args=args)
+    node = Fix2CsvNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.on_shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
-rospy.loginfo ("Start GPS /fix topic to csv file")
-rospy.loginfo ("  delay = %5.2fsec", stamp_delay)
-
-try:
-	while not rospy.is_shutdown():
-		rospy.spin()
-finally:
-	f.close()
-	rospy.loginfo ("close " + fname)
-
+if __name__ == '__main__':
+    main()
