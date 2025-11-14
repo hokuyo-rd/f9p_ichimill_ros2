@@ -33,11 +33,13 @@ class F9PDriverNode(Node):
         self.pub_gga = self.create_publisher(Sentence, 'nmea_gga', 10)
         self.pub_nmea = self.create_publisher(Sentence, 'nmea_sentence', 10)
         self.pub_zda = self.create_publisher(Sentence, 'nmea_zda', 10)
+        self.pub_rmc = self.create_publisher(Sentence, 'nmea_rmc', 10)
         self.subscription = self.create_subscription(String, "/softbank/rtcm_data", self.cb_rtcm_data, 10)
 
         self.seq_gga = 0
         self.seq_nmea = 0
         self.seq_zda = 0
+        self.seq_rmc = 0
         self.rtcm_data = b""
 
     def cb_rtcm_data(self, msg):
@@ -95,6 +97,16 @@ class F9PDriverNode(Node):
                         zda_sentence.sentence = gps_str
                         self.pub_zda.publish(zda_sentence)
                         self.seq_zda += 1
+
+                    # RMCセンテンスの処理と発行
+                    if "RMC" in gps_str:
+                        rmc_sentence = Sentence()
+                        rmc_sentence.header.stamp = self.get_clock().now().to_msg()
+                        rmc_sentence.header.frame_id = 'gps'
+                        # seqはROS 2では非推奨
+                        rmc_sentence.sentence = gps_str
+                        self.pub_rmc.publish(rmc_sentence)
+                        self.seq_rmc += 1
 
                     # 全てのNMEAセンテンスを発行
                     nmea_sentence = Sentence()
