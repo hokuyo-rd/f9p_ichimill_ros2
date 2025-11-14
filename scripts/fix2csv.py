@@ -44,7 +44,7 @@ class Fix2CsvNode(Node):
             self.seq += 1
             log_time = datetime.fromtimestamp(current_time.seconds_nanoseconds()[0])
             line_str = (
-                f"{self.seq},{msg.latitude},{msg.longitude},"
+                f"{self.seq},{msg.latitude},{msg.longitude},{msg.altitude},"
                 f"status={msg.status.status},service={msg.status.service},"
                 f"stamp={log_time}\n"
             )
