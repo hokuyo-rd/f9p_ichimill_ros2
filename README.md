@@ -1,34 +1,40 @@
-# f9p_ichimill
+# f9p_ichimill_ros2
 
+f9p_ichimill_ros2
+北陽電機 R&D室 髙橋が対応
+
+gps_ichimill.launch.py
 シリアルポートに接続されたGPSレシーバF9Pで、ichimillサービスと連携し補正済み位置情報を取得する。<br>
 
 ![rosgraph_f9p_](https://user-images.githubusercontent.com/16064762/136687925-9b3c98f7-54e4-4dc8-8176-0805cb15f15a.png)
 
-
+gps_ntripcaster.launch.py
 または、善意の基準局等　公開されたNtripCasterのデータを使い補正済み位置情報を取得する。<br>
 
 
 ## 確認環境
 ・PC
-  Ubuntu 18.04 / ROS Melodic　<br>
+  Ubuntu 22.04 / ROS2 humble　<br>
 　インターネット回線に接続出来ること。<br>
 
-・C099-F9P application board <br>
-・GGB0710(2周波対応GNSSアンテナ)<br>
-
-※Ubuntu 20.04 / ROS Noetic対応進行中 <br>
+・ZED-F9P-04B-01 <br>
+・ヘリカルアンテナ <br>
 
 ## Setup
 
+USBシリアルポートを/dev/GNSS_SERIALに書き換えて、実行権限666を自動付与対応を必ず行うこと
+
 ### インストール
 ```
-$ cd ~/catkin_ws/src
-$ git clone https://github.com/terakenxx/f9p_ichimill.git
-$ sudo apt install ros-melodic-nmea-navsat-driver
-
-$ catkin build
+$ cd ~/{your-ros2-ws}/src
+$ git clone https://github.com/hokuyo-rd/f9p_ichimill_ros2.git
+$ git clone https://github.com/hokuyo-rd/nmea_msgs.git # Gpzda メッセージのため
+$ git clone https://github.com/hokuyo-rd/nmea_navsat_driver_ros2.git # Gpgga, Gprmc, Gpzda トピック対応版
+$ colcon build --packages-select nmea_msgs
+$ colcon build --packages-select nmea_navsat_driver_ros2
+$ colcon build --packages-select f9p_ichimill_ros2
+$ source {your-ros2-ws}/devel/setup.bash
 ```
-
 ### 環境設定
 
 #### ichimillサービスへ接続する場合

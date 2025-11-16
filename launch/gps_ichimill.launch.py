@@ -10,7 +10,7 @@ def generate_launch_description():
             executable='f9p_driver',
             name='f9p_driver',
             parameters=[
-                {'port': '/dev/ttyACM0'},
+                {'port': '/dev/GNSS_SERIAL'},
                 {'baud': 230400},
                 {'debug': True},
             ]
