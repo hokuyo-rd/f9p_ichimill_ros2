@@ -37,19 +37,18 @@ sudo udevadm trigger
 
 #### 確認方法
 
+/dev/GNSS_SERIAL が存在し、/dev/ttyACM0 を指していること。
+
 ```
 ls -l /dev/GNSS_SERIAL
 ls -l /dev/ttyACM0
 ```
 
-/dev/GNSS_SERIAL が存在し、/dev/ttyACM0 を指していること。
-
-例: lrwxrwxrwx 1 root root 7 Nov 16 11:45 /dev/GNSS_SERIAL -> ttyACM0/dev/ttyACM0 のパーミッションが $666$ になっていること。
+例: lrwxrwxrwx 1 root root 7 Nov 16 11:45 /dev/GNSS_SERIAL -> ttyACM0/dev/ttyACM0 のパーミッションが 666 になっていること。
 例: crw-rw-rw- 1 root dialout 166, 0 Nov 16 11:45 /dev/ttyACM0
 
-
-
 ### インストール
+
 ```
 cd ~/{your-ros2-ws}/src
 git clone https://github.com/hokuyo-rd/f9p_ichimill_ros2.git
@@ -62,7 +61,6 @@ source {your-ros2-ws}/devel/setup.bash
 ```
 
 ### 環境設定
-
 
 ```
 # ichimillサービスへ接続する場合
