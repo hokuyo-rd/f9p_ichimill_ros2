@@ -6,8 +6,8 @@ import serial
 import rclpy
 from rclpy.node import Node
 from nmea_msgs.msg import Sentence
-from std_msgs.msg import String
-
+from std_msgs.msg import UInt8MultiArray
+from rclpy.executors import SingleThreadedExecutor
 
 def calcultateCheckSum(stringToCheck):
     xsum_calc = 0
@@ -34,7 +34,7 @@ class F9PDriverNode(Node):
         self.pub_nmea = self.create_publisher(Sentence, 'nmea_sentence', 10)
         self.pub_zda = self.create_publisher(Sentence, 'nmea_zda', 10)
         self.pub_rmc = self.create_publisher(Sentence, 'nmea_rmc', 10)
-        self.subscription = self.create_subscription(String, "/softbank/rtcm_data", self.cb_rtcm_data, 10)
+        self.subscription = self.create_subscription(UInt8MultiArray, "/softbank/rtcm_data", self.cb_rtcm_data, 10)
 
         self.seq_gga = 0
         self.seq_nmea = 0
@@ -42,19 +42,23 @@ class F9PDriverNode(Node):
         self.seq_rmc = 0
         self.rtcm_data = b""
 
-    def cb_rtcm_data(self, msg):
-        # ROS 2のichimill_connect.pyはlatin-1でエンコードしているため、
-        # それに合わせてデコードしてbytesに戻す
-        self.rtcm_data = msg.data.encode('latin-1')
+    def cb_rtcm_data(self, msg: UInt8MultiArray):
+        self.rtcm_data = bytes(msg.data)
 
     def run(self):
         try:
             self.get_logger().info("Serial port opening...")
             gps_serial = serial.Serial(port=self.serial_port, baudrate=self.serial_baud, timeout=2)
             self.get_logger().info(f"OK. Port: {self.serial_port}, Baudrate: {self.serial_baud}")
+            
+            executor = SingleThreadedExecutor()
+            executor.add_node(self)
 
             try:
                 while rclpy.ok():
+                
+                    executor.spin_once(timeout_sec=0.0)
+                    
                     try:
                         gps_line = gps_serial.readline()
                         gps_str = gps_line.decode('ascii').strip()
@@ -76,8 +80,8 @@ class F9PDriverNode(Node):
                             gga_string = gps_str.replace('$GNGGA', 'GPGGA')
                             if '*' in gga_string:
                                 gga_string = gga_string.split('*')[0]
-                            checksum = calcultateCheckSum(gga_string[1:]) # $を除いて計算
-                            send_data = f"{gga_string}*{checksum}\r\n"
+                            checksum = calcultateCheckSum(gga_string)
+                            send_data = f"${gga_string}*{checksum}\r\n"
 
                         gga_sentence = Sentence()
                         gga_sentence.header.stamp = self.get_clock().now().to_msg()

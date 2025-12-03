@@ -5,9 +5,10 @@ import base64
 import socket
 
 import rclpy
+import time
 from rclpy.node import Node
 from nmea_msgs.msg import Sentence
-from std_msgs.msg import String
+from std_msgs.msg import UInt8MultiArray
 
 
 class IchimillConnectNode(Node):
@@ -30,7 +31,7 @@ class IchimillConnectNode(Node):
         self.mountpoint = self.get_parameter('mountpoint').get_parameter_value().string_value
 
         # Publisher, Subscriber, Socketの初期化
-        self.pub = self.create_publisher(String, '/softbank/rtcm_data', 10)
+        self.pub = self.create_publisher(UInt8MultiArray, '/softbank/rtcm_data', 10)
         self.tcpip = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcpip.settimeout(10.0)
 
@@ -85,6 +86,8 @@ class IchimillConnectNode(Node):
         try:
             self.tcpip.send(send_data.encode('ascii'))
             send_time = self.get_clock().now()
+            
+            time.sleep(0.25)
 
             rtk_datas_bytes = self.tcpip.recv(4096)
             if self.debug:
@@ -93,12 +96,10 @@ class IchimillConnectNode(Node):
             response_delay = self.get_clock().now() - send_time
             if response_delay.nanoseconds > 3.0 * 1e9:
                 self.get_logger().warn(f"NTRIP Caster Response Delay > 3.0s: {response_delay.nanoseconds} nsec on host: {self.host_url}")
-
+            
             if rtk_datas_bytes:
-                msg = String()
-                # RTCMデータはバイナリなので、そのままstringに格納するのはベストではないが、
-                # ROS1の挙動を維持するため、受信したbytesをそのままstringとして扱う
-                msg.data = rtk_datas_bytes.decode('latin-1') # エラーを起こさずにbytesをstringに変換
+                msg = UInt8MultiArray()
+                msg.data = list(rtk_datas_bytes)
                 self.pub.publish(msg)
 
         except socket.timeout:
