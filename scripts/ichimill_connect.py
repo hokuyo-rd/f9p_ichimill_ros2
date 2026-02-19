@@ -57,6 +57,7 @@ class IchimillConnectNode(Node):
             data = self.tcpip.recv(1024).decode('ascii')
             self.get_logger().info(f"Caster Response: {data.strip()}")
             if "ICY 200 OK" in data:
+                self.get_logger().info("Caster ResponccseOK")
                 self.subscription = self.create_subscription(Sentence, "/nmea_gga", self.cb_gga, 10)
                 return True
             else:
@@ -103,9 +104,9 @@ class IchimillConnectNode(Node):
                 self.pub.publish(msg)
 
         except socket.timeout:
-            self.get_logger().warn("NTRIP Caster timeout.")
+            self.get_logger().warn("NTRIP Caster timeout. Retrying...")
         except Exception as ex:
-            self.get_logger().error(f"Exception error: {ex}")
+            self.get_logger().error(f"Exception error: {ex}. Retrying...")
         finally:
             self.mutex_server = False
 
@@ -117,11 +118,14 @@ class IchimillConnectNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = IchimillConnectNode()
-    if node.connect_to_caster():
-        try:
-            rclpy.spin(node)
-        except KeyboardInterrupt:
-            pass
+    
+    while not node.connect_to_caster():
+        time.sleep(15)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+                
     node.shutdown()
     node.destroy_node()
     rclpy.shutdown()
