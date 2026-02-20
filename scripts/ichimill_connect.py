@@ -32,12 +32,12 @@ class IchimillConnectNode(Node):
 
         # Publisher, Subscriber, Socketの初期化
         self.pub = self.create_publisher(UInt8MultiArray, '/softbank/rtcm_data', 10)
-        self.tcpip = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.tcpip.settimeout(10.0)
-
         self.mutex_server = False
 
     def connect_to_caster(self):
+        self.tcpip = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcpip.settimeout(10.0)
+        
         pwd = base64.b64encode(f"{self.username}:{self.password}".encode('ascii')).decode('ascii')
         header = (
             f"GET /{self.mountpoint} HTTP/1.1\r\n"
@@ -57,7 +57,7 @@ class IchimillConnectNode(Node):
             data = self.tcpip.recv(1024).decode('ascii')
             self.get_logger().info(f"Caster Response: {data.strip()}")
             if "ICY 200 OK" in data:
-                self.get_logger().info("Caster ResponccseOK")
+                self.get_logger().info("Caster ResponceOK")
                 self.subscription = self.create_subscription(Sentence, "/nmea_gga", self.cb_gga, 10)
                 return True
             else:
@@ -118,14 +118,14 @@ class IchimillConnectNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = IchimillConnectNode()
-    
     while not node.connect_to_caster():
+        node.shutdown()
         time.sleep(15)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-                
+
     node.shutdown()
     node.destroy_node()
     rclpy.shutdown()
