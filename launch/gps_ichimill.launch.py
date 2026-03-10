@@ -8,7 +8,8 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     package_share = get_package_share_directory('f9p_ichimill')
-    config_file = os.path.join(package_share, 'config', 'config.yaml')
+    #config_file = os.path.join(package_share, 'config', 'config.yaml')
+    config_file = '/data/rsf_config/ichimill_param/config.yaml'
 
     username = ''
     password = ''
