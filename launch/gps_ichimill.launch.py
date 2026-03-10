@@ -1,10 +1,24 @@
 import os
+import yaml
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 def generate_launch_description():
+    package_share = get_package_share_directory('f9p_ichimill')
+    config_file = os.path.join(package_share, 'config', 'config.yaml')
+
+    username = ''
+    password = ''
+    if os.path.exists(config_file):
+        with open(config_file, 'r', encoding='utf-8') as stream:
+            config = yaml.safe_load(stream) or {}
+
+        params = config.get('f9p_ichimill', {}).get('ros__parameters', {})
+        username = params.get('username', '')
+        password = params.get('password', '')
 
     # launchコマンドの引数を宣言
     port_arg = DeclareLaunchArgument(
@@ -43,8 +57,8 @@ def generate_launch_description():
             name='ichimill_connect',
             output='screen',
             parameters=[
-                {'username': ''},
-                {'password': ''},
+                {'username': username},
+                {'password': password},
                 {'port': 2101},
                 {'host': 'ntrip.ales-corp.co.jp'},
                 {'mountpoint': '32M7NHS'},
