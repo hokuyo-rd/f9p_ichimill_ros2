@@ -33,6 +33,8 @@ class IchimillConnectNode(Node):
         # Publisher, Subscriber, Socketの初期化
         self.pub = self.create_publisher(UInt8MultiArray, '/softbank/rtcm_data', 10)
         self.mutex_server = False
+        self.last_gga_process_time = 0.0
+        self.gga_process_interval_sec = 1.0
 
     def connect_to_caster(self):
         self.tcpip = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -71,6 +73,11 @@ class IchimillConnectNode(Node):
             return False
 
     def cb_gga(self, data):
+        now_monotonic = time.monotonic()
+        if now_monotonic - self.last_gga_process_time < self.gga_process_interval_sec:
+            return
+        self.last_gga_process_time = now_monotonic
+
         send_data = data.sentence
 
         if send_data.split(',').count('') > 1:
