@@ -112,13 +112,22 @@ class IchimillConnectNode(Node):
 
         except socket.timeout:
             self.get_logger().warn("NTRIP Caster timeout. Retrying...")
+            self.restart_connection()
         except Exception as ex:
             self.get_logger().error(f"Exception error: {ex}. Retrying...")
+            self.restart_connection()
         finally:
             self.mutex_server = False
 
+    def restart_connection(self):
+        self.shutdown()
+        while rclpy.ok() and not self.connect_to_caster():
+            self.shutdown()
+            time.sleep(15)
+
     def shutdown(self):
-        self.tcpip.close()
+        if hasattr(self, "tcpip"):
+            self.tcpip.close()
         self.get_logger().info("NTRIP Caster disconnected")
 
 
