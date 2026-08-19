@@ -33,6 +33,24 @@ class TestGnssStreamParser(unittest.TestCase):
         self.assertEqual(pvt["fix_type"], 3)
         self.assertTrue(pvt["gnss_fix_ok"])
 
+    def test_decodes_all_nav_pvt_message_fields(self):
+        payload = struct.pack(
+            "<IHBBBBBBIiBBBBiiiiIIiiiiiIIH6sihH",
+            123456, 2026, 8, 19, 12, 34, 56, 0x07, 20, -100,
+            3, 0x03, 0x40, 18, 1391234567, 351234567, 12345, 10000,
+            1200, 2300, 100, -200, 300, 400, 500, 600, 700, 80,
+            b"\x01\x02\x03\x04\x05\x06", 900, -10, 11)
+
+        pvt = decode_nav_pvt(make_ubx(0x01, 0x07, payload))
+
+        self.assertEqual(pvt["i_tow"], 123456)
+        self.assertEqual((pvt["year"], pvt["month"], pvt["day"]), (2026, 8, 19))
+        self.assertEqual(pvt["num_sv"], 18)
+        self.assertEqual(pvt["lon"], 1391234567)
+        self.assertEqual(pvt["vel_e"], -200)
+        self.assertEqual(pvt["reserved1"], [1, 2, 3, 4, 5, 6])
+        self.assertEqual(pvt["mag_dec"], -10)
+
     def test_rejects_bad_checksum_and_recovers(self):
         bad_frame = bytearray(make_ubx(0x01, 0x07, bytes(92)))
         bad_frame[-1] ^= 0xFF

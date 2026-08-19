@@ -71,7 +71,11 @@ class GnssStreamParser:
 
 
 def decode_nav_pvt(frame):
-    """Decode fields required for a NavSatFix from a UBX-NAV-PVT frame."""
+    """Decode a UBX-NAV-PVT frame into raw fields and SI conveniences.
+
+    The raw values retain the units used by ``ublox_msgs/msg/NavPVT``.  The
+    existing converted keys are kept for the accompanying ``NavSatFix``.
+    """
     if (len(frame) != NAV_PVT_PAYLOAD_LENGTH + 8
             or frame[2] != NAV_PVT_CLASS
             or frame[3] != NAV_PVT_ID
@@ -79,18 +83,22 @@ def decode_nav_pvt(frame):
         raise ValueError("not a valid UBX-NAV-PVT frame")
 
     payload = frame[6:-2]
-    fix_type = payload[20]
-    flags = payload[21]
-    longitude, latitude, height, mean_sea_level = struct.unpack_from(
-        "<iiii", payload, 24)
-    horizontal_accuracy, vertical_accuracy = struct.unpack_from("<II", payload, 40)
-    return {
-        "fix_type": fix_type,
-        "gnss_fix_ok": bool(flags & 0x01),
-        "longitude": longitude * 1e-7,
-        "latitude": latitude * 1e-7,
-        "height": height * 1e-3,
-        "mean_sea_level": mean_sea_level * 1e-3,
-        "horizontal_accuracy": horizontal_accuracy * 1e-3,
-        "vertical_accuracy": vertical_accuracy * 1e-3,
-    }
+    fields = struct.unpack_from("<IHBBBBBBIiBBBBiiiiIIiiiiiIIH6sihH", payload)
+    names = (
+        "i_tow", "year", "month", "day", "hour", "min", "sec", "valid",
+        "t_acc", "nano", "fix_type", "flags", "flags2", "num_sv", "lon",
+        "lat", "height_raw", "h_msl", "h_acc", "v_acc", "vel_n", "vel_e",
+        "vel_d", "g_speed", "head_mot", "s_acc", "head_acc", "p_dop",
+        "reserved1", "head_veh", "mag_dec", "mag_acc")
+    result = dict(zip(names, fields))
+    result["reserved1"] = list(result["reserved1"])
+    result.update({
+        "gnss_fix_ok": bool(result["flags"] & 0x01),
+        "longitude": result["lon"] * 1e-7,
+        "latitude": result["lat"] * 1e-7,
+        "height": result["height_raw"] * 1e-3,
+        "mean_sea_level": result["h_msl"] * 1e-3,
+        "horizontal_accuracy": result["h_acc"] * 1e-3,
+        "vertical_accuracy": result["v_acc"] * 1e-3,
+    })
+    return result

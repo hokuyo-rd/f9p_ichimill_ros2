@@ -8,6 +8,7 @@ from rclpy.node import Node
 from nmea_msgs.msg import Sentence
 from std_msgs.msg import UInt8MultiArray
 from sensor_msgs.msg import NavSatFix, NavSatStatus
+from ublox_msgs.msg import NavPVT
 from rclpy.executors import SingleThreadedExecutor
 
 from scripts.ubx import GnssStreamParser, decode_nav_pvt
@@ -37,7 +38,7 @@ class F9PDriverNode(Node):
         self.pub_nmea = self.create_publisher(Sentence, 'nmea_sentence', 10)
         self.pub_zda = self.create_publisher(Sentence, 'nmea_zda', 10)
         self.pub_rmc = self.create_publisher(Sentence, 'nmea_rmc', 10)
-        self.pub_nav_pvt = self.create_publisher(UInt8MultiArray, 'ubx_nav_pvt', 10)
+        self.pub_nav_pvt = self.create_publisher(NavPVT, 'ubx_nav_pvt', 10)
         self.pub_nav_sat_fix = self.create_publisher(NavSatFix, 'nav_pvt_fix', 10)
         self.subscription = self.create_subscription(UInt8MultiArray, "/softbank/rtcm_data", self.cb_rtcm_data, 10)
 
@@ -52,16 +53,25 @@ class F9PDriverNode(Node):
         self.rtcm_data = bytes(msg.data)
 
     def process_nav_pvt(self, frame):
-        """Publish both the original NAV-PVT frame and its standard position."""
+        """Publish NAV-PVT using its native message and as a standard fix."""
         try:
             pvt = decode_nav_pvt(frame)
         except ValueError as ex:
             self.get_logger().warning(f"Invalid UBX-NAV-PVT message: {ex}")
             return
 
-        raw_message = UInt8MultiArray()
-        raw_message.data = list(frame)
-        self.pub_nav_pvt.publish(raw_message)
+        nav_pvt = NavPVT()
+        nav_pvt.header.stamp = self.get_clock().now().to_msg()
+        nav_pvt.header.frame_id = 'gps'
+        for field in (
+                'i_tow', 'year', 'month', 'day', 'hour', 'min', 'sec', 'valid',
+                't_acc', 'nano', 'fix_type', 'flags', 'flags2', 'num_sv', 'lon',
+                'lat', 'h_msl', 'h_acc', 'v_acc', 'vel_n', 'vel_e', 'vel_d',
+                'g_speed', 'head_mot', 's_acc', 'head_acc', 'p_dop', 'reserved1',
+                'head_veh', 'mag_dec', 'mag_acc'):
+            setattr(nav_pvt, field, pvt[field])
+        nav_pvt.height = pvt['height_raw']
+        self.pub_nav_pvt.publish(nav_pvt)
 
         fix = NavSatFix()
         fix.header.stamp = self.get_clock().now().to_msg()

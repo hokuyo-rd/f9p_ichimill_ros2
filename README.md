@@ -92,7 +92,7 @@ ros2 launch f9p_ichimill gps_ntripcaster.launch.py
 F9Pの出力にUBX-NAV-PVTを有効にすると、NMEAのGGA/ZDA/RMCと同じシリアル通信上で
 バイナリメッセージも受信できます。チェックサムが正常なNAV-PVTは次のトピックへ発行します。
 
-* `ubx_nav_pvt` (`std_msgs/msg/UInt8MultiArray`): UBXフレーム全体（同期文字とチェックサムを含む）
+* `ubx_nav_pvt` (`ublox_msgs/msg/NavPVT`): 時刻、測位状態、位置、速度、方位、精度を含むNAV-PVTデータ
 * `nav_pvt_fix` (`sensor_msgs/msg/NavSatFix`): 緯度、経度、楕円体高、測位状態、位置精度
 
 F9P側のポート設定で、必要なNMEAメッセージとUBX-NAV-PVTの両方を有効にしてください。

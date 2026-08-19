@@ -20,6 +20,7 @@
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>ublox_msgs</depend>
   <depend>nmea_msgs</depend>
   <depend>nmea_navsat_driver</depend>
 
