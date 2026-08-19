@@ -7,7 +7,10 @@ import rclpy
 from rclpy.node import Node
 from nmea_msgs.msg import Sentence
 from std_msgs.msg import UInt8MultiArray
+from sensor_msgs.msg import NavSatFix, NavSatStatus
 from rclpy.executors import SingleThreadedExecutor
+
+from scripts.ubx import GnssStreamParser, decode_nav_pvt
 
 def calcultateCheckSum(stringToCheck):
     xsum_calc = 0
@@ -34,6 +37,8 @@ class F9PDriverNode(Node):
         self.pub_nmea = self.create_publisher(Sentence, 'nmea_sentence', 10)
         self.pub_zda = self.create_publisher(Sentence, 'nmea_zda', 10)
         self.pub_rmc = self.create_publisher(Sentence, 'nmea_rmc', 10)
+        self.pub_nav_pvt = self.create_publisher(UInt8MultiArray, 'ubx_nav_pvt', 10)
+        self.pub_nav_sat_fix = self.create_publisher(NavSatFix, 'nav_pvt_fix', 10)
         self.subscription = self.create_subscription(UInt8MultiArray, "/softbank/rtcm_data", self.cb_rtcm_data, 10)
 
         self.seq_gga = 0
@@ -41,9 +46,84 @@ class F9PDriverNode(Node):
         self.seq_zda = 0
         self.seq_rmc = 0
         self.rtcm_data = b""
+        self.stream_parser = GnssStreamParser()
 
     def cb_rtcm_data(self, msg: UInt8MultiArray):
         self.rtcm_data = bytes(msg.data)
+
+    def process_nav_pvt(self, frame):
+        """Publish both the original NAV-PVT frame and its standard position."""
+        try:
+            pvt = decode_nav_pvt(frame)
+        except ValueError as ex:
+            self.get_logger().warning(f"Invalid UBX-NAV-PVT message: {ex}")
+            return
+
+        raw_message = UInt8MultiArray()
+        raw_message.data = list(frame)
+        self.pub_nav_pvt.publish(raw_message)
+
+        fix = NavSatFix()
+        fix.header.stamp = self.get_clock().now().to_msg()
+        fix.header.frame_id = 'gps'
+        fix.status.status = (NavSatStatus.STATUS_FIX
+                             if pvt["gnss_fix_ok"] and pvt["fix_type"] >= 2
+                             else NavSatStatus.STATUS_NO_FIX)
+        fix.status.service = NavSatStatus.SERVICE_GPS
+        fix.latitude = pvt["latitude"]
+        fix.longitude = pvt["longitude"]
+        fix.altitude = pvt["height"]
+        fix.position_covariance[0] = pvt["horizontal_accuracy"] ** 2
+        fix.position_covariance[4] = pvt["horizontal_accuracy"] ** 2
+        fix.position_covariance[8] = pvt["vertical_accuracy"] ** 2
+        fix.position_covariance_type = NavSatFix.COVARIANCE_TYPE_DIAGONAL_KNOWN
+        self.pub_nav_sat_fix.publish(fix)
+
+        if self.debug:
+            self.get_logger().info(
+                f"UBX-NAV-PVT: lat={fix.latitude:.7f}, "
+                f"lon={fix.longitude:.7f}, height={fix.altitude:.3f} m, "
+                f"fixType={pvt['fix_type']}")
+
+    def process_nmea(self, gps_str):
+        """Process and publish an NMEA sentence."""
+        if not gps_str:
+            return
+
+        if self.debug:
+            self.get_logger().info(f"Received NMEA: {gps_str}")
+
+        # GGAセンテンスの処理と発行
+        if "GGA" in gps_str:
+            send_data = gps_str
+            if "$GNGGA" in gps_str:
+                gga_string = gps_str.replace('$GNGGA', 'GPGGA')
+                if '*' in gga_string:
+                    gga_string = gga_string.split('*')[0]
+                checksum = calcultateCheckSum(gga_string)
+                send_data = f"${gga_string}*{checksum}\r\n"
+
+            gga_sentence = self.make_nmea_message(send_data)
+            self.pub_gga.publish(gga_sentence)
+            self.seq_gga += 1
+
+        if "ZDA" in gps_str:
+            self.pub_zda.publish(self.make_nmea_message(gps_str))
+            self.seq_zda += 1
+
+        if "RMC" in gps_str:
+            self.pub_rmc.publish(self.make_nmea_message(gps_str))
+            self.seq_rmc += 1
+
+        self.pub_nmea.publish(self.make_nmea_message(gps_str))
+        self.seq_nmea += 1
+
+    def make_nmea_message(self, sentence):
+        message = Sentence()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = 'gps'
+        message.sentence = sentence
+        return message
 
     def run(self):
         try:
@@ -60,66 +140,18 @@ class F9PDriverNode(Node):
                     executor.spin_once(timeout_sec=0.0)
                     
                     try:
-                        gps_line = gps_serial.readline()
-                        gps_str = gps_line.decode('ascii').strip()
-                    except (UnicodeDecodeError, serial.SerialException):
-                        # デコードエラーやシリアルエラーは無視して次の行を読む
+                        serial_data = gps_serial.read(gps_serial.in_waiting or 1)
+                    except serial.SerialException:
                         continue
 
-                    if not gps_str:
-                        continue
-
-                    if self.debug:
-                        self.get_logger().info(f"Received: {gps_str}")
-
-                    # GGAセンテンスの処理と発行
-                    if "GGA" in gps_str:
-                        send_data = gps_str
-                        if "$GNGGA" in gps_str:
-                            # チェックサム再計算
-                            gga_string = gps_str.replace('$GNGGA', 'GPGGA')
-                            if '*' in gga_string:
-                                gga_string = gga_string.split('*')[0]
-                            checksum = calcultateCheckSum(gga_string)
-                            send_data = f"${gga_string}*{checksum}\r\n"
-
-                        gga_sentence = Sentence()
-                        gga_sentence.header.stamp = self.get_clock().now().to_msg()
-                        gga_sentence.header.frame_id = 'gps'
-                        # seqはROS 2では非推奨だが、互換性のために残す
-                        # gga_sentence.header.seq = self.seq_gga
-                        gga_sentence.sentence = send_data
-                        self.pub_gga.publish(gga_sentence)
-                        self.seq_gga += 1
-
-                    # ZDAセンテンスの処理と発行
-                    if "ZDA" in gps_str:
-                        zda_sentence = Sentence()
-                        zda_sentence.header.stamp = self.get_clock().now().to_msg()
-                        zda_sentence.header.frame_id = 'gps'
-                        # seqはROS 2では非推奨
-                        zda_sentence.sentence = gps_str
-                        self.pub_zda.publish(zda_sentence)
-                        self.seq_zda += 1
-
-                    # RMCセンテンスの処理と発行
-                    if "RMC" in gps_str:
-                        rmc_sentence = Sentence()
-                        rmc_sentence.header.stamp = self.get_clock().now().to_msg()
-                        rmc_sentence.header.frame_id = 'gps'
-                        # seqはROS 2では非推奨
-                        rmc_sentence.sentence = gps_str
-                        self.pub_rmc.publish(rmc_sentence)
-                        self.seq_rmc += 1
-
-                    # 全てのNMEAセンテンスを発行
-                    nmea_sentence = Sentence()
-                    nmea_sentence.header.stamp = self.get_clock().now().to_msg()
-                    nmea_sentence.header.frame_id = 'gps'
-                    # nmea_sentence.header.seq = self.seq_nmea
-                    nmea_sentence.sentence = gps_str
-                    self.pub_nmea.publish(nmea_sentence)
-                    self.seq_nmea += 1
+                    for message_type, message in self.stream_parser.feed(serial_data):
+                        if message_type == "nmea":
+                            try:
+                                self.process_nmea(message.decode('ascii'))
+                            except UnicodeDecodeError:
+                                continue
+                        elif message[2] == 0x01 and message[3] == 0x07:
+                            self.process_nav_pvt(message)
 
                     # Ntrip CasterからのRTCMデータをF9Pに送信
                     if len(self.rtcm_data) > 0:
