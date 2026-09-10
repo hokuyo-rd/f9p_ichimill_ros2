@@ -295,31 +295,41 @@ class PointPerfectConnectNode(Node):
             f"/{self.mountpoint} (tls={self.ntrip_use_tls}, chunked={chunked})")
         return sock, decoder, leftover
 
-    def send_gga_if_due(self, force: bool = False):
-        """NEAR-* マウントポイント向けに GGA を定期送信する。"""
+    def send_gga_if_due(self, force: bool = False) -> bool:
+        """NEAR-* マウントポイント向けに GGA を定期送信する。
+
+        送信に失敗した場合は False を返す。PC のネットワークが切り替わって
+        IP アドレスが変わると既存の TCP 接続は無効になり、recv がタイムアウト
+        するまで数十秒気づけないため、送信失敗を接続断とみなして即座に
+        張り直せるようにしている。
+        """
         if self.latest_gga is None:
             if not self.gga_warned:
                 self.gga_warned = True
                 self.get_logger().warn(
                     f"No GGA received on {self.gga_topic} yet. "
                     "NEAR-* mountpoints need the receiver position to start streaming.")
-            return
+            return True
 
         now = time.monotonic()
         if not force and (now - self.last_gga_sent) < self.gga_interval:
-            return
+            return True
 
         with self.socket_lock:
             if self.socket is None:
-                return
+                return False
             try:
                 self.socket.sendall(self.latest_gga.encode('ascii'))
             except OSError as ex:
-                self.get_logger().warn(f"Failed to send GGA to the caster: {ex}")
-                return
+                if self.running and rclpy.ok():
+                    self.get_logger().warn(
+                        f"Failed to send GGA to the caster: {ex}. "
+                        "The connection looks dead. Reconnecting...")
+                return False
         self.last_gga_sent = now
         if self.debug:
             self.get_logger().info(f"Sent GGA to caster: {self.latest_gga.strip()}")
+        return True
 
     def ntrip_loop(self):
         """接続・受信・再接続を行うワーカースレッド。"""
@@ -338,7 +348,8 @@ class PointPerfectConnectNode(Node):
                     self.socket = sock
 
                 self.last_gga_sent = 0.0
-                self.send_gga_if_due(force=True)
+                if not self.send_gga_if_due(force=True):
+                    continue
                 if leftover:
                     self.publish_payload(decoder.feed(leftover) if decoder else leftover)
 
@@ -352,7 +363,8 @@ class PointPerfectConnectNode(Node):
                             "NTRIP Caster is silent. Retrying..." if idle_count >= 2
                             else "NTRIP Caster timeout.")
                         # 位置が未送信だと配信が始まらないので送り直す
-                        self.send_gga_if_due(force=True)
+                        if not self.send_gga_if_due(force=True):
+                            break
                         if idle_count >= 3:
                             break
                         continue
@@ -363,7 +375,8 @@ class PointPerfectConnectNode(Node):
 
                     idle_count = 0
                     self.publish_payload(decoder.feed(data) if decoder else data)
-                    self.send_gga_if_due()
+                    if not self.send_gga_if_due():
+                        break
 
             except (OSError, ValueError, ConnectionError) as ex:
                 # shutdown() がソケットを閉じた場合の例外は正常終了なので無視する
