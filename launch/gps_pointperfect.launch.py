@@ -29,7 +29,7 @@ def generate_launch_description():
 
     # launchコマンドの引数を宣言
     port_arg = DeclareLaunchArgument(
-        'port', default_value='/dev/GNSS_SERIAL', description='Serial port for F9P receiver'
+        'port', default_value='/dev/ttyACM0', description='Serial port for F9P receiver'
     )
     baud_arg = DeclareLaunchArgument(
         'baud', default_value='230400', description='Baud rate for F9P receiver'

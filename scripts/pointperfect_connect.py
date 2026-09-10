@@ -2,44 +2,59 @@
 # -*- coding: utf-8 -*-
 """u-blox PointPerfect (Thingstream) から SPARTN 補正を取得する ROS 2 ノード。
 
-PointPerfect の IP 配信は MQTT over TLS (クライアント証明書認証) で提供される。
-本ノードは以下のトピックを購読し、受信したバイト列をそのまま
-UInt8MultiArray として ROS トピックへ流す。f9p_driver がそれを
-ZED-F9P のシリアルポートへ書き込む。
+PointPerfect には配信方式が 2 つあり、Thingstream の Location Thing の
+Credentials タブに表示されている方を使う。
 
-  /pp/ip/<region>   : SPARTN 2.0.1 補正データ
-  /pp/ubx/0236/ip   : UBX-RXM-SPARTNKEY (動的復号キー。補正の利用に必須)
-  /pp/ubx/mga       : AssistNow Online (任意。初期測位の高速化)
+  mode: "ntrip" (既定)
+    NTRIP Credentials (Endpoint / Mountpoint / Username / Password) が
+    表示されている契約。ppntrip.services.u-blox.com へ NTRIP 接続し、
+    SPARTN をそのまま受け取る。NEAR-* マウントポイントは受信機位置に
+    応じたタイルを配信するため、GGA をキャスタへ送る必要がある。
+    NTRIP 配信では認証がキャスタ側で行われ、動的キー (UBX-RXM-SPARTNKEY)
+    は配布されないため、受信機へキーを投入する必要はない。
 
-いずれも受信機がそのまま解釈できる形式で配信されるため、加工せずに転送する。
+  mode: "mqtt"
+    MQTT Credentials (Client ID / 証明書 / 秘密鍵) が表示されている契約。
+    pp.services.u-blox.com へ TLS 接続し、以下を購読する。
+      /pp/ip/<region>   : SPARTN 2.0.1 補正データ
+      /pp/ubx/0236/ip   : UBX-RXM-SPARTNKEY (動的復号キー。補正の利用に必須)
+      /pp/ubx/mga       : AssistNow Online (任意)
+
+いずれの方式でも、受信したバイト列は加工せず UInt8MultiArray として
+発行し、f9p_driver が ZED-F9P のシリアルポートへ書き込む。
 """
 
+import base64
 import json
 import os
+import socket
 import ssl
 import tempfile
+import threading
+import time
 
 import rclpy
 from rclpy.node import Node
+from nmea_msgs.msg import Sentence
 from std_msgs.msg import UInt8MultiArray
 
-try:
-    import paho.mqtt.client as mqtt
-except ImportError as ex:  # pragma: no cover
-    raise SystemExit(
-        "paho-mqtt is required for pointperfect_connect. "
-        "Install it with: pip3 install paho-mqtt") from ex
+# --- NTRIP 配信 (PointPerfect NTRIP service) ---
+DEFAULT_NTRIP_HOST = "ppntrip.services.u-blox.com"
+DEFAULT_NTRIP_PORT = 2102          # 2101 = HTTP, 2102 = HTTPS(TLS)
+DEFAULT_MOUNTPOINT = "NEAR-SPARTN"
+CLIENT_AGENT = "NTRIP ros2_pointperfect_connect/1.0"
+RECV_SIZE = 4096
 
-DEFAULT_HOST = "pp.services.u-blox.com"
-DEFAULT_PORT = 8883
-# PointPerfect が対応する地域: us / eu / kr / au / jp
+# --- MQTT 配信 ---
+DEFAULT_MQTT_HOST = "pp.services.u-blox.com"
+DEFAULT_MQTT_PORT = 8883
 DEFAULT_REGION = "jp"
 
 
 def find_in_json(data, target_key):
     """ネストした dict/list から指定キーの値を再帰的に探す。
 
-    Thingstream が配布する ucenter-config.json は階層構造が版によって
+    Thingstream が配布する JSON 設定は階層構造が版によって
     異なるため、キー名で走査して取り出す。
     """
     if isinstance(data, dict):
@@ -57,68 +72,320 @@ def find_in_json(data, target_key):
     return None
 
 
+class ChunkedDecoder:
+    """NTRIP v2 (HTTP/1.1) の chunked transfer-encoding を解く。
+
+    NTRIP v1 の生ストリームと異なり、v2 ではチャンク長のヘッダが
+    挟まる。これを取り除かないと SPARTN が壊れて受信機に渡ってしまう。
+    """
+
+    def __init__(self):
+        self.buf = b""
+        self.state = "size"
+        self.remaining = 0
+        self.finished = False
+
+    def feed(self, data: bytes) -> bytes:
+        self.buf += data
+        out = bytearray()
+        while not self.finished:
+            if self.state == "size":
+                index = self.buf.find(b"\r\n")
+                if index < 0:
+                    break
+                line = self.buf[:index]
+                self.buf = self.buf[index + 2:]
+                token = line.split(b";")[0].strip()
+                if not token:
+                    continue  # チャンク間の空行
+                try:
+                    self.remaining = int(token, 16)
+                except ValueError:
+                    raise ValueError(f"Invalid chunk size: {line!r}")
+                if self.remaining == 0:
+                    self.finished = True
+                    break
+                self.state = "data"
+            elif self.state == "data":
+                if not self.buf:
+                    break
+                take = min(self.remaining, len(self.buf))
+                out += self.buf[:take]
+                self.buf = self.buf[take:]
+                self.remaining -= take
+                if self.remaining == 0:
+                    self.state = "crlf"
+            else:  # "crlf": チャンク末尾の CRLF を捨てる
+                if len(self.buf) < 2:
+                    break
+                self.buf = self.buf[2:]
+                self.state = "size"
+        return bytes(out)
+
+
 class PointPerfectConnectNode(Node):
     def __init__(self):
         super().__init__('pointperfect_connect')
 
-        # パラメータの宣言
+        # --- 共通 ---
+        self.declare_parameter('mode', 'ntrip')          # ntrip / mqtt
         self.declare_parameter('debug', False)
-        self.declare_parameter('host', DEFAULT_HOST)
-        self.declare_parameter('port', DEFAULT_PORT)
+        self.declare_parameter('correction_topic', '/pointperfect/correction_data')
+
+        # --- NTRIP 配信 ---
+        self.declare_parameter('ntrip_host', DEFAULT_NTRIP_HOST)
+        self.declare_parameter('ntrip_port', DEFAULT_NTRIP_PORT)
+        self.declare_parameter('ntrip_mountpoint', DEFAULT_MOUNTPOINT)
+        self.declare_parameter('ntrip_username', '')
+        self.declare_parameter('ntrip_password', '')
+        # HTTPS ポート (2102) を使う場合は true
+        self.declare_parameter('ntrip_use_tls', True)
+        # NEAR-* マウントポイントは位置に応じたタイルを配信するため GGA が要る
+        self.declare_parameter('gga_topic', '/nmea_gga')
+        self.declare_parameter('gga_interval_sec', 10.0)
+        self.declare_parameter('reconnect_interval_sec', 5.0)
+
+        # --- MQTT 配信 ---
+        self.declare_parameter('host', DEFAULT_MQTT_HOST)
+        self.declare_parameter('port', DEFAULT_MQTT_PORT)
         self.declare_parameter('region', DEFAULT_REGION)
         self.declare_parameter('client_id', '')
-        # Thingstream からダウンロードした証明書・秘密鍵
         self.declare_parameter('cert_file', '')
         self.declare_parameter('key_file', '')
         self.declare_parameter('ca_file', '')
-        # ucenter-config.json をそのまま使う場合はこちらを指定する
         self.declare_parameter('credentials_file', '')
-        # 補正データの発行先トピック
-        self.declare_parameter('correction_topic', '/pointperfect/correction_data')
-        # 購読トピックを明示指定したい場合 (localized distribution 等)。
-        # 空なら region から自動生成する。
         self.declare_parameter('correction_mqtt_topics', [''])
         self.declare_parameter('key_mqtt_topic', '/pp/ubx/0236/ip')
-        # AssistNow Online (UBX-MGA) も受信して受信機へ渡すか
         self.declare_parameter('enable_assistnow', False)
         self.declare_parameter('assistnow_mqtt_topic', '/pp/ubx/mga')
         self.declare_parameter('keepalive', 60)
 
-        self.debug = self.get_parameter('debug').get_parameter_value().bool_value
-        self.host = self.get_parameter('host').get_parameter_value().string_value
-        self.port = self.get_parameter('port').get_parameter_value().integer_value
-        self.region = self.get_parameter('region').get_parameter_value().string_value.lower()
-        self.client_id = self.get_parameter('client_id').get_parameter_value().string_value
-        self.cert_file = self.get_parameter('cert_file').get_parameter_value().string_value
-        self.key_file = self.get_parameter('key_file').get_parameter_value().string_value
-        self.ca_file = self.get_parameter('ca_file').get_parameter_value().string_value
-        self.credentials_file = self.get_parameter('credentials_file').get_parameter_value().string_value
-        self.correction_topic = self.get_parameter('correction_topic').get_parameter_value().string_value
-        self.key_mqtt_topic = self.get_parameter('key_mqtt_topic').get_parameter_value().string_value
-        self.enable_assistnow = self.get_parameter('enable_assistnow').get_parameter_value().bool_value
-        self.assistnow_mqtt_topic = self.get_parameter('assistnow_mqtt_topic').get_parameter_value().string_value
-        self.keepalive = self.get_parameter('keepalive').get_parameter_value().integer_value
+        get = self.get_parameter
+        self.mode = get('mode').get_parameter_value().string_value.lower()
+        self.debug = get('debug').get_parameter_value().bool_value
+        self.correction_topic = get('correction_topic').get_parameter_value().string_value
+
+        self.ntrip_host = get('ntrip_host').get_parameter_value().string_value
+        self.ntrip_port = get('ntrip_port').get_parameter_value().integer_value
+        self.mountpoint = get('ntrip_mountpoint').get_parameter_value().string_value
+        self.ntrip_username = get('ntrip_username').get_parameter_value().string_value
+        self.ntrip_password = get('ntrip_password').get_parameter_value().string_value
+        self.ntrip_use_tls = get('ntrip_use_tls').get_parameter_value().bool_value
+        self.gga_topic = get('gga_topic').get_parameter_value().string_value
+        self.gga_interval = get('gga_interval_sec').get_parameter_value().double_value
+        self.reconnect_interval = get('reconnect_interval_sec').get_parameter_value().double_value
+
+        self.host = get('host').get_parameter_value().string_value
+        self.port = get('port').get_parameter_value().integer_value
+        self.region = get('region').get_parameter_value().string_value.lower()
+        self.client_id = get('client_id').get_parameter_value().string_value
+        self.cert_file = get('cert_file').get_parameter_value().string_value
+        self.key_file = get('key_file').get_parameter_value().string_value
+        self.ca_file = get('ca_file').get_parameter_value().string_value
+        self.credentials_file = get('credentials_file').get_parameter_value().string_value
+        self.key_mqtt_topic = get('key_mqtt_topic').get_parameter_value().string_value
+        self.enable_assistnow = get('enable_assistnow').get_parameter_value().bool_value
+        self.assistnow_mqtt_topic = get('assistnow_mqtt_topic').get_parameter_value().string_value
+        self.keepalive = get('keepalive').get_parameter_value().integer_value
 
         mqtt_topics = [t for t in
-                       self.get_parameter('correction_mqtt_topics').get_parameter_value().string_array_value
-                       if t]
+                       get('correction_mqtt_topics').get_parameter_value().string_array_value if t]
         self.correction_mqtt_topics = mqtt_topics or [f"/pp/ip/{self.region}"]
 
-        # 一時ファイルに書き出した証明書 (終了時に削除する)
+        self.pub = self.create_publisher(UInt8MultiArray, self.correction_topic, 50)
+
+        self.correction_bytes_total = 0
+        self.spartn_key_received = False
+
+        # NTRIP 用の状態
+        self.socket = None
+        self.socket_lock = threading.Lock()
+        self.latest_gga = None
+        self.last_gga_sent = 0.0
+        self.gga_warned = False
+        self.running = True
+        self.thread = None
+
+        # MQTT 用の状態
+        self.client = None
         self._temp_files = []
 
-        self.pub = self.create_publisher(UInt8MultiArray, self.correction_topic, 50)
-        self.spartn_key_received = False
-        self.correction_bytes_total = 0
-
-        if self.credentials_file:
+        if self.mode == 'ntrip':
+            self.create_subscription(Sentence, self.gga_topic, self.cb_gga, 10)
+        elif self.credentials_file:
             self.load_credentials_file(self.credentials_file)
 
-        self.client = None
+    # ======================================================================
+    # NTRIP 配信
+    # ======================================================================
+    def cb_gga(self, msg: Sentence):
+        """受信機の GGA を保持する。キャスタへの送信は受信スレッドが行う。"""
+        sentence = msg.sentence.strip()
+        if not sentence.startswith('$'):
+            return
+        if sentence.split(',').count('') > 1:
+            self.get_logger().warn(
+                f"Missing the necessary elements in GGA sentence: {sentence}",
+                throttle_duration_sec=10.0)
+            return
+        self.latest_gga = sentence + "\r\n"
 
-    # --- 認証情報 -----------------------------------------------------------
+    def build_ntrip_request(self) -> bytes:
+        credential = base64.b64encode(
+            f"{self.ntrip_username}:{self.ntrip_password}".encode('ascii')).decode('ascii')
+        return (
+            f"GET /{self.mountpoint} HTTP/1.1\r\n"
+            f"Host: {self.ntrip_host}:{self.ntrip_port}\r\n"
+            f"Ntrip-Version: Ntrip/2.0\r\n"
+            f"User-Agent: {CLIENT_AGENT}\r\n"
+            f"Authorization: Basic {credential}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode('ascii')
+
+    def connect_ntrip(self):
+        """NTRIP キャスタへ接続し (ソケット, chunkedデコーダ, 残バイト) を返す。
+
+        認証エラー等の恒久的な失敗では None を返す。
+        """
+        raw = socket.create_connection((self.ntrip_host, self.ntrip_port), timeout=15.0)
+        if self.ntrip_use_tls:
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(raw, server_hostname=self.ntrip_host)
+        else:
+            sock = raw
+        sock.settimeout(15.0)
+
+        sock.sendall(self.build_ntrip_request())
+
+        # ヘッダを終端まで読む
+        header = b""
+        while b"\r\n\r\n" not in header:
+            part = sock.recv(RECV_SIZE)
+            if not part:
+                sock.close()
+                raise ConnectionError("Caster closed the connection while sending headers")
+            header += part
+            if len(header) > 16384:
+                sock.close()
+                raise ConnectionError("NTRIP response header is too large")
+
+        head, _, leftover = header.partition(b"\r\n\r\n")
+        head_text = head.decode('ascii', errors='ignore')
+        status_line = head_text.split("\r\n")[0]
+        self.get_logger().info(f"Caster Response: {status_line}")
+
+        if not ("ICY 200 OK" in head_text or " 200 " in status_line or "200 OK" in status_line):
+            sock.close()
+            if "401" in status_line:
+                self.get_logger().error(
+                    "NTRIP authentication failed (401). "
+                    "Check ntrip_username / ntrip_password.")
+            elif "404" in status_line:
+                self.get_logger().error(
+                    f"Mountpoint '{self.mountpoint}' not found (404). "
+                    "Check ntrip_mountpoint.")
+            else:
+                self.get_logger().error(f"NTRIP Caster ResponseError!! : {status_line}")
+            return None
+
+        chunked = "chunked" in head_text.lower()
+        decoder = ChunkedDecoder() if chunked else None
+        self.get_logger().info(
+            f"PointPerfect NTRIP connected: {self.ntrip_host}:{self.ntrip_port}"
+            f"/{self.mountpoint} (tls={self.ntrip_use_tls}, chunked={chunked})")
+        return sock, decoder, leftover
+
+    def send_gga_if_due(self, force: bool = False):
+        """NEAR-* マウントポイント向けに GGA を定期送信する。"""
+        if self.latest_gga is None:
+            if not self.gga_warned:
+                self.gga_warned = True
+                self.get_logger().warn(
+                    f"No GGA received on {self.gga_topic} yet. "
+                    "NEAR-* mountpoints need the receiver position to start streaming.")
+            return
+
+        now = time.monotonic()
+        if not force and (now - self.last_gga_sent) < self.gga_interval:
+            return
+
+        with self.socket_lock:
+            if self.socket is None:
+                return
+            try:
+                self.socket.sendall(self.latest_gga.encode('ascii'))
+            except OSError as ex:
+                self.get_logger().warn(f"Failed to send GGA to the caster: {ex}")
+                return
+        self.last_gga_sent = now
+        if self.debug:
+            self.get_logger().info(f"Sent GGA to caster: {self.latest_gga.strip()}")
+
+    def ntrip_loop(self):
+        """接続・受信・再接続を行うワーカースレッド。"""
+        while self.running and rclpy.ok():
+            decoder = None
+            try:
+                self.get_logger().info(
+                    f"PointPerfect NTRIP connecting to "
+                    f"{self.ntrip_host}:{self.ntrip_port}/{self.mountpoint} ...")
+                result = self.connect_ntrip()
+                if result is None:
+                    # 認証・マウントポイントの誤りは再試行しても直らない
+                    break
+                sock, decoder, leftover = result
+                with self.socket_lock:
+                    self.socket = sock
+
+                self.last_gga_sent = 0.0
+                self.send_gga_if_due(force=True)
+                if leftover:
+                    self.publish_payload(decoder.feed(leftover) if decoder else leftover)
+
+                idle_count = 0
+                while self.running and rclpy.ok():
+                    try:
+                        data = sock.recv(RECV_SIZE)
+                    except socket.timeout:
+                        idle_count += 1
+                        self.get_logger().warn(
+                            "NTRIP Caster is silent. Retrying..." if idle_count >= 2
+                            else "NTRIP Caster timeout.")
+                        # 位置が未送信だと配信が始まらないので送り直す
+                        self.send_gga_if_due(force=True)
+                        if idle_count >= 3:
+                            break
+                        continue
+
+                    if not data:
+                        self.get_logger().warn("NTRIP Caster disconnected. Reconnecting...")
+                        break
+
+                    idle_count = 0
+                    self.publish_payload(decoder.feed(data) if decoder else data)
+                    self.send_gga_if_due()
+
+            except (OSError, ValueError, ConnectionError) as ex:
+                # shutdown() がソケットを閉じた場合の例外は正常終了なので無視する
+                if self.running and rclpy.ok():
+                    self.get_logger().error(f"NTRIP error: {ex}. Retrying...")
+            finally:
+                with self.socket_lock:
+                    if self.socket is not None:
+                        try:
+                            self.socket.close()
+                        except OSError:
+                            pass
+                        self.socket = None
+
+            if self.running and rclpy.ok():
+                time.sleep(self.reconnect_interval)
+
+    # ======================================================================
+    # MQTT 配信
+    # ======================================================================
     def load_credentials_file(self, path: str):
-        """Thingstream の ucenter-config.json から接続情報を読み込む。"""
+        """Thingstream の JSON 設定から MQTT 接続情報を読み込む。"""
         if not os.path.exists(path):
             self.get_logger().error(f"Credentials file not found: {path}")
             return
@@ -172,9 +439,10 @@ class PointPerfectConnectNode(Node):
             return False
         return True
 
-    # --- MQTT ---------------------------------------------------------------
     def create_client(self):
         """paho-mqtt クライアントを生成する (paho 1.x / 2.x 両対応)。"""
+        import paho.mqtt.client as mqtt
+
         if hasattr(mqtt, 'CallbackAPIVersion'):  # paho-mqtt 2.x
             client = mqtt.Client(
                 callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
@@ -225,50 +493,91 @@ class PointPerfectConnectNode(Node):
 
     def on_message(self, client, userdata, msg):
         """MQTT で受信したデータをそのまま ROS トピックへ流す。"""
-        payload = bytes(msg.payload)
-        if not payload:
-            return
-
-        if msg.topic == self.key_mqtt_topic and not self.spartn_key_received:
+        if msg.topic == self.key_mqtt_topic and not self.spartn_key_received and msg.payload:
             self.spartn_key_received = True
             self.get_logger().info(
-                f"SPARTN dynamic keys received ({len(payload)} bytes, UBX-RXM-SPARTNKEY).")
+                f"SPARTN dynamic keys received ({len(msg.payload)} bytes, UBX-RXM-SPARTNKEY).")
+        self.publish_payload(bytes(msg.payload), source=msg.topic)
 
+    # ======================================================================
+    # 共通
+    # ======================================================================
+    def publish_payload(self, payload: bytes, source: str = 'ntrip'):
+        """受信したバイト列を加工せず ROS トピックへ発行する。"""
+        if not payload:
+            return
+        first = self.correction_bytes_total == 0
         self.correction_bytes_total += len(payload)
+        if first:
+            self.get_logger().info(
+                f"Receiving SPARTN correction data ({len(payload)} bytes in the first chunk).")
         if self.debug:
             self.get_logger().info(
-                f"MQTT {msg.topic}: {len(payload)} bytes "
-                f"(total {self.correction_bytes_total} bytes)")
+                f"{source}: {len(payload)} bytes (total {self.correction_bytes_total} bytes)")
 
-        out = UInt8MultiArray()
-        out.data = list(payload)
-        self.pub.publish(out)
+        msg = UInt8MultiArray()
+        msg.data = list(payload)
+        self.pub.publish(msg)
 
-    # --- ライフサイクル -----------------------------------------------------
     def start(self) -> bool:
-        if not self.validate_credentials():
-            return False
+        if self.mode == 'ntrip':
+            if not self.ntrip_username or not self.ntrip_password:
+                self.get_logger().error(
+                    "Missing NTRIP credentials. Set ntrip_username / ntrip_password "
+                    "from the Credentials tab of your Thingstream Location Thing.")
+                return False
+            self.thread = threading.Thread(target=self.ntrip_loop, daemon=True)
+            self.thread.start()
+            return True
 
-        self.client = self.create_client()
-        try:
-            self.get_logger().info(
-                f"PointPerfect connecting to {self.host}:{self.port} ...")
-            self.client.connect(self.host, self.port, keepalive=self.keepalive)
-        except Exception as ex:
-            self.get_logger().error(f"PointPerfect connect error: {ex}")
-            return False
+        if self.mode == 'mqtt':
+            if not self.validate_credentials():
+                return False
+            try:
+                self.client = self.create_client()
+            except ImportError:
+                self.get_logger().error(
+                    "paho-mqtt is required for mode 'mqtt'. Install it with: "
+                    "sudo apt install python3-paho-mqtt")
+                return False
+            try:
+                self.get_logger().info(
+                    f"PointPerfect connecting to {self.host}:{self.port} ...")
+                self.client.connect(self.host, self.port, keepalive=self.keepalive)
+            except Exception as ex:
+                self.get_logger().error(f"PointPerfect connect error: {ex}")
+                return False
+            # 受信は paho のワーカースレッドに任せ、本スレッドは rclpy を回す
+            self.client.loop_start()
+            return True
 
-        # 受信は paho のワーカースレッドに任せ、本スレッドは rclpy を回す
-        self.client.loop_start()
-        return True
+        self.get_logger().error(f"Unknown mode '{self.mode}'. Use 'ntrip' or 'mqtt'.")
+        return False
 
     def shutdown(self):
+        self.running = False
+        with self.socket_lock:
+            if self.socket is not None:
+                # recv() でブロックしている受信スレッドを解放する
+                try:
+                    self.socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    self.socket.close()
+                except OSError:
+                    pass
+                self.socket = None
+        if self.thread is not None:
+            self.thread.join(timeout=3.0)
+            self.thread = None
         if self.client is not None:
             self.client.loop_stop()
             try:
                 self.client.disconnect()
             except Exception:
                 pass
+            self.client = None
         for path in self._temp_files:
             try:
                 os.remove(path)

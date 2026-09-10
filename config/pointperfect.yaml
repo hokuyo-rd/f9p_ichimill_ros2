@@ -1,40 +1,50 @@
 # u-blox PointPerfect (Thingstream) 接続設定
 #
-# Thingstream の Location Thing を作成し、"Credentials" タブから
-#   * Client ID
-#   * Client Key   (device-xxxx-pp-key.pem)
-#   * Client Certificate (device-xxxx-pp-cert.crt)
-#   * Amazon Root CA (AmazonRootCA1.pem)
-# を取得して以下に設定する。
-# u-center 用の ucenter-config.json をダウンロード済みなら
-# credentials_file にそのパスを書くだけでよい (client_id / 証明書を自動抽出)。
+# Thingstream ポータルの Location Thing → Credentials タブに表示されている
+# 方式に合わせて mode を選ぶ。
+#   NTRIP Credentials (Endpoint / Mountpoint / Username / Password) → mode: "ntrip"
+#   MQTT  Credentials (Client ID / 証明書 / 秘密鍵)                 → mode: "mqtt"
+#
+# 【注意】このファイルは git 管理下にある。実運用の ID/パスワードはここへ
+# 書かず、/data/rsf_config/pointperfect_param/config.yaml に置くこと
+# (launch はそちらが存在すれば優先して読み込む)。
 pointperfect_connect:
   ros__parameters:
-    # --- 認証情報 ---
-    client_id: ""
-    cert_file: ""
-    key_file: ""
-    ca_file: ""
-    credentials_file: ""
+    mode: "ntrip"
 
-    # --- 接続先 ---
+    # ================= NTRIP 配信 (mode: ntrip) =================
+    ntrip_host: "ppntrip.services.u-blox.com"
+    # 2101 = HTTP, 2102 = HTTPS(TLS)。ntrip_use_tls と合わせること。
+    ntrip_port: 2102
+    ntrip_use_tls: true
+    ntrip_mountpoint: "NEAR-SPARTN"
+    ntrip_username: ""
+    ntrip_password: ""
+    # NEAR-* マウントポイントは受信機位置に応じたタイルを配信するため、
+    # GGA をキャスタへ定期送信する必要がある。
+    gga_topic: "/nmea_gga"
+    gga_interval_sec: 10.0
+    reconnect_interval_sec: 5.0
+
+    # ================= MQTT 配信 (mode: mqtt) =================
     host: "pp.services.u-blox.com"
     port: 8883
     # 配信地域: us / eu / kr / au / jp
     region: "jp"
     keepalive: 60
-
-    # --- 購読トピック ---
-    # 空のままなら region から "/pp/ip/<region>" を自動生成する。
-    # Localized distribution を使う場合のみ明示指定する。
+    client_id: ""
+    cert_file: ""
+    key_file: ""
+    ca_file: ""
+    # u-center 用 JSON があればこれだけでよい (ClientID/証明書/鍵を自動抽出)
+    credentials_file: ""
+    # 空なら region から "/pp/ip/<region>" を自動生成する
     correction_mqtt_topics: [""]
-    # SPARTN 動的キー (UBX-RXM-SPARTNKEY)。補正の復号に必須。
+    # SPARTN 動的キー (UBX-RXM-SPARTNKEY)。MQTT 配信では補正の復号に必須。
     key_mqtt_topic: "/pp/ubx/0236/ip"
-
-    # --- AssistNow Online (任意) ---
     enable_assistnow: false
     assistnow_mqtt_topic: "/pp/ubx/mga"
 
-    # --- ROS 側 ---
+    # ================= 共通 =================
     correction_topic: "/pointperfect/correction_data"
     debug: false

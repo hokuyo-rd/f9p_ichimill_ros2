@@ -54,9 +54,8 @@ ls -l /dev/ttyACM0
 ### インストール
 
 ```
-# PointPerfectを使う場合はMQTTクライアントが必要
+# PointPerfectをMQTT配信で使う場合のみ必要 (NTRIP配信では不要)
 sudo apt install python3-paho-mqtt
-# もしくは pip3 install paho-mqtt
 
 cd ~/{your-ros2-ws}/src
 git clone https://github.com/hokuyo-rd/f9p_ichimill_ros2.git
@@ -110,32 +109,70 @@ ZED-F9P-04B (FW HPG 1.32) はSPARTN 2.0.1を入力プロトコルとしてサポ
 u-blox PointPerfectのSSR補正で PPP-RTK 測位ができる。<br>
 水平精度 < 0.06 m (CEP)、収束時間 < 45 s (データシート Table 4)。
 
+### 配信方式は契約により2種類ある
+
+Thingstreamポータルの **Location Thing → Credentials** タブに表示されている方を使う。
+`config/pointperfect.yaml` の `mode` で切り替える。
+
+| Credentialsタブの表示 | `mode` | 接続先 | 認証 |
+| --- | --- | --- | --- |
+| **NTRIP Credentials**<br>(Endpoint / Mountpoint / Username / Password) | `ntrip` (既定) | `ppntrip.services.u-blox.com` | ユーザー名・パスワード |
+| **MQTT Credentials**<br>(Client ID / 証明書 / 秘密鍵) | `mqtt` | `pp.services.u-blox.com` | クライアント証明書 |
+
 ### ノード構成
 
 | ノード | 役割 |
 | --- | --- |
-| `pointperfect_connect` | Thingstream の MQTT ブローカへ TLS 接続し、SPARTN補正と動的キーを取得して `/pointperfect/correction_data` (`UInt8MultiArray`) へ発行 |
+| `pointperfect_connect` | PointPerfectへ接続しSPARTN補正を取得、`/pointperfect/correction_data` (`UInt8MultiArray`) へ発行 |
 | `f9p_driver` | NMEAの発行と、補正データのF9Pシリアルポートへの書き戻し。起動時にUBX-CFG-VALSETで受信機を設定 |
 | `nmea_topic_driver` | NMEA から `/fix` などへ変換 |
 
-購読するMQTTトピックは以下の3つ。いずれも受信機がそのまま解釈できる形式なので、加工せずシリアルへ流す。
+## NTRIP配信の場合 (mode: ntrip)
 
-| MQTTトピック | 内容 |
-| --- | --- |
-| `/pp/ip/<region>` | SPARTN 2.0.1 補正データ |
-| `/pp/ubx/0236/ip` | UBX-RXM-SPARTNKEY (動的復号キー)。**これが無いと補正が効かない** |
-| `/pp/ubx/mga` | AssistNow Online (任意。`enable_assistnow: true` で有効) |
+### 設定
 
-### 認証情報の設定
-
-Thingstream で PointPerfect の Location Thing を作成し、Credentials から
-Client ID・クライアント証明書・秘密鍵・Amazon Root CA を取得する。<br>
-`config/pointperfect.yaml` を編集するか、運用機では `/data/rsf_config/pointperfect_param/config.yaml`
-に置く (存在すればそちらが優先される)。
+Credentialsタブの値を `/data/rsf_config/pointperfect_param/config.yaml` に書く。<br>
+リポジトリ内の `config/pointperfect.yaml` はgit管理下なので、**実運用のID/パスワードは
+そちらへ書かないこと**。launchは `/data/rsf_config/pointperfect_param/config.yaml` が
+存在すればそちらを優先して読み込む。
 
 ```yaml
 pointperfect_connect:
   ros__parameters:
+    mode: "ntrip"
+    ntrip_host: "ppntrip.services.u-blox.com"
+    ntrip_port: 2102          # 2101 = HTTP, 2102 = HTTPS(TLS)
+    ntrip_use_tls: true       # ntrip_port と必ず合わせる
+    ntrip_mountpoint: "NEAR-SPARTN"
+    ntrip_username: "＜Credentialsタブの Username＞"
+    ntrip_password: "＜Credentialsタブの Password＞"
+```
+
+### GGAの送信について
+
+`NEAR-SPARTN` のような **NEAR-\*** マウントポイントは、受信機の位置に応じたタイルの
+補正を配信する。そのためクライアントからキャスタへ **GGAを送り続ける必要がある**。<br>
+本ノードは `f9p_driver` が発行する `/nmea_gga` を購読し、接続直後と `gga_interval_sec`
+(既定10秒) ごとにキャスタへ送信する。<br>
+測位できておらずGGAが出ていないと補正が始まらないため、その場合は次の警告を出す。
+
+```
+No GGA received on /nmea_gga yet. NEAR-* mountpoints need the receiver position to start streaming.
+```
+
+### 動的キーは不要
+
+MQTT配信と異なり、NTRIP配信では認証がキャスタ側で行われ、動的キー
+(UBX-RXM-SPARTNKEY) は配布されない。受信機へキーを投入する必要はない。
+
+## MQTT配信の場合 (mode: mqtt)
+
+Client ID・クライアント証明書・秘密鍵・Amazon Root CAを設定する。
+
+```yaml
+pointperfect_connect:
+  ros__parameters:
+    mode: "mqtt"
     client_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
     cert_file: "/data/rsf_config/pointperfect_param/device-xxxx-pp-cert.crt"
     key_file:  "/data/rsf_config/pointperfect_param/device-xxxx-pp-key.pem"
@@ -143,21 +180,26 @@ pointperfect_connect:
     region: "jp"     # us / eu / kr / au / jp
 ```
 
-u-center用の `ucenter-config.json` をダウンロード済みなら、そのパスを `credentials_file`
-に指定するだけでよい (Client ID と証明書・鍵をJSONから自動抽出し、一時ファイルへ展開する)。
+u-center用の `ucenter-config.json` があれば、そのパスを `credentials_file` に
+指定するだけでよい (Client IDと証明書・鍵をJSONから自動抽出する)。<br>
+`sudo apt install python3-paho-mqtt` が必要 (NTRIP配信では不要)。
 
-```yaml
-    credentials_file: "/data/rsf_config/pointperfect_param/ucenter-config.json"
-```
+購読するMQTTトピックは以下の3つ。
 
-### 受信機の自動設定
+| MQTTトピック | 内容 |
+| --- | --- |
+| `/pp/ip/<region>` | SPARTN 2.0.1 補正データ |
+| `/pp/ubx/0236/ip` | UBX-RXM-SPARTNKEY (動的復号キー)。**これが無いと補正が効かない** |
+| `/pp/ubx/mga` | AssistNow Online (任意。`enable_assistnow: true` で有効) |
+
+## 受信機の自動設定
 
 `gps_pointperfect.launch.py` では `configure_receiver:=True` (既定) で、起動時に
 UBX-CFG-VALSET を送って以下を設定する。適用先は **RAMレイヤのみ** なので、
 電源を入れ直せば受信機のFlash設定に戻る。
 
 * SPARTN / RTCM3 / UBX 入力の有効化 (`CFG-<port>INPROT-*`)
-* `CFG-SPARTN-USE_SOURCE = IP`
+* `CFG-SPARTN-USE_SOURCE = IP` (NTRIP配信・MQTT配信ともにIP。L-band受信機を使う場合のみ別)
 * NMEA GGA / **ZDA** / RMC 出力の有効化 (`CFG-MSGOUT-NMEA_ID_*`)
 * 測位レート `CFG-RATE-MEAS` / `CFG-RATE-NAV` (既定 5 Hz)
 
@@ -171,7 +213,7 @@ ros2 launch f9p_ichimill gps_pointperfect.launch.py configure_receiver:=False
 NAK が返る場合は `interface` パラメータ (usb / uart1 / uart2 / i2c / spi) と
 ファームウェアバージョン (HPG 1.32以上) を確認すること。
 
-### 主なlaunch引数
+## 主なlaunch引数
 
 | 引数 | 既定値 | 説明 |
 | --- | --- | --- |
@@ -180,12 +222,14 @@ NAK が返る場合は `interface` パラメータ (usb / uart1 / uart2 / i2c / 
 | `interface` | `usb` | F9P側の接続インタフェース |
 | `nav_rate_hz` | `5.0` | 測位レート [Hz]。ZED-F9PのRTKは最大7 Hz |
 | `configure_receiver` | `True` | 起動時のUBX-CFG-VALSET送信 |
-| `debug_pointperfect` | `False` | MQTT受信のデバッグログ |
+| `debug_pointperfect` | `False` | 補正データ受信のデバッグログ |
 | `debug_driver` | `False` | シリアル入出力のデバッグログ |
 
-### 動作確認
+## 動作確認
 
 ```
+ros2 launch f9p_ichimill gps_pointperfect.launch.py
+
 # SPARTN補正が流れているか
 ros2 topic hz /pointperfect/correction_data
 
@@ -196,12 +240,29 @@ ros2 topic echo /nmea_gga
 ros2 topic echo /fix
 ```
 
-起動直後に `SPARTN dynamic keys received (... UBX-RXM-SPARTNKEY).` がログに出れば
-動的キーの取得に成功している。
+正常時のログ (NTRIP配信)
 
-### 補足
+```
+PointPerfect NTRIP connecting to ppntrip.services.u-blox.com:2102/NEAR-SPARTN ...
+Caster Response: HTTP/1.1 200 OK
+PointPerfect NTRIP connected: ... (tls=True, chunked=True)
+Receiving SPARTN correction data (... bytes in the first chunk).
+Receiver configuration accepted (UBX-ACK-ACK).
+```
 
-* PointPerfectのL-band配信を使う場合はNEO-D9S等の受信機が別途必要。本パッケージはIP(MQTT)配信のみ対応。
-* PointPerfectをNTRIP経由 (RTCM) で契約している場合は、既存の `gps_ntripcaster.launch.py` が利用できる。
+### 切り分け
+
+| 症状 | 原因 |
+| --- | --- |
+| `Missing NTRIP credentials.` | `ntrip_username` / `ntrip_password` が空 |
+| `NTRIP authentication failed (401).` | ユーザー名・パスワードの誤り |
+| `Mountpoint '...' not found (404).` | `ntrip_mountpoint` の誤り |
+| `No GGA received on /nmea_gga yet.` | 受信機が測位できておらずGGAが出ていない。NEAR-\*では補正が始まらない |
+| 接続はするがデータが来ない | GGA未送信、または契約プラン外の地域 |
+| `Receiver rejected the configuration (UBX-ACK-NAK).` | `interface` パラメータかFWバージョンの不一致 |
+
+## 補足
+
+* PointPerfectのL-band配信を使う場合はNEO-D9S等の受信機が別途必要。本パッケージはIP配信 (NTRIP / MQTT) のみ対応。
 * 補正データトピックは `f9p_driver` の `correction_topic` パラメータで切り替えられるため、
   ichimill / NtripCaster / PointPerfect で同じドライバを共用している。
