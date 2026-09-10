@@ -1,0 +1,40 @@
+# u-blox PointPerfect (Thingstream) 接続設定
+#
+# Thingstream の Location Thing を作成し、"Credentials" タブから
+#   * Client ID
+#   * Client Key   (device-xxxx-pp-key.pem)
+#   * Client Certificate (device-xxxx-pp-cert.crt)
+#   * Amazon Root CA (AmazonRootCA1.pem)
+# を取得して以下に設定する。
+# u-center 用の ucenter-config.json をダウンロード済みなら
+# credentials_file にそのパスを書くだけでよい (client_id / 証明書を自動抽出)。
+pointperfect_connect:
+  ros__parameters:
+    # --- 認証情報 ---
+    client_id: ""
+    cert_file: ""
+    key_file: ""
+    ca_file: ""
+    credentials_file: ""
+
+    # --- 接続先 ---
+    host: "pp.services.u-blox.com"
+    port: 8883
+    # 配信地域: us / eu / kr / au / jp
+    region: "jp"
+    keepalive: 60
+
+    # --- 購読トピック ---
+    # 空のままなら region から "/pp/ip/<region>" を自動生成する。
+    # Localized distribution を使う場合のみ明示指定する。
+    correction_mqtt_topics: [""]
+    # SPARTN 動的キー (UBX-RXM-SPARTNKEY)。補正の復号に必須。
+    key_mqtt_topic: "/pp/ubx/0236/ip"
+
+    # --- AssistNow Online (任意) ---
+    enable_assistnow: false
+    assistnow_mqtt_topic: "/pp/ubx/mga"
+
+    # --- ROS 側 ---
+    correction_topic: "/pointperfect/correction_data"
+    debug: false

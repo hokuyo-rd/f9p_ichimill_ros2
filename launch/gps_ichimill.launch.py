@@ -50,6 +50,8 @@ def generate_launch_description():
                 {'port': LaunchConfiguration('port')},
                 {'baud': LaunchConfiguration('baud')},
                 {'debug': LaunchConfiguration('debug_driver')},
+                # ichimill から流れてくる RTCM3 を受け取るトピック
+                {'correction_topic': '/softbank/rtcm_data'},
             ]
         ),
         Node(

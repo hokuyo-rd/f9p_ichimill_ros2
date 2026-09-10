@@ -21,6 +21,11 @@
   <depend>std_msgs</depend>
   <depend>nmea_msgs</depend>
   <depend>nmea_navsat_driver</depend>
+  <depend>sensor_msgs</depend>
+  <exec_depend>python3-serial</exec_depend>
+  <!-- PointPerfect (Thingstream) への MQTT 接続に使用 -->
+  <exec_depend>python3-paho-mqtt</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
 
   <!-- The export tag contains other, unspecified, tags -->
   <export>

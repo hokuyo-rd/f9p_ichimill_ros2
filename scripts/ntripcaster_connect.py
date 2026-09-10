@@ -7,7 +7,7 @@ import socket
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
-from std_msgs.msg import String
+from std_msgs.msg import UInt8MultiArray
 
 CLIENT_AGENT = "ros2_ntripcaster_connect"
 BUF_SIZE = 4096
@@ -32,7 +32,8 @@ class NtripCasterConnectNode(Node):
         self.mountpoint = self.get_parameter('mountpoint').get_parameter_value().string_value
 
         # Publisherの初期化
-        self.pub = self.create_publisher(String, '/caster/rtcm_data', 10)
+        # f9p_driver が UInt8MultiArray を購読するため、バイト列のまま発行する
+        self.pub = self.create_publisher(UInt8MultiArray, '/caster/rtcm_data', 50)
         self.tcpip = None
 
     def run(self):
@@ -59,8 +60,6 @@ class NtripCasterConnectNode(Node):
 
                 if not data:
                     self.get_logger().warn("Header Response Fail... Retrying connection...")
-                    self.tcpip.close()
-                    self.create_timer(1.0, lambda: None) # 1秒待機
                     continue
 
                 self.get_logger().info(f"Caster Response: {data.strip()}")
@@ -84,8 +83,8 @@ class NtripCasterConnectNode(Node):
                         if self.debug:
                             self.get_logger().info(f"NTRIP data received: {len(rtk_datas)} bytes")
                         
-                        msg = String()
-                        msg.data = rtk_datas.decode('latin-1')
+                        msg = UInt8MultiArray()
+                        msg.data = list(rtk_datas)
                         self.pub.publish(msg)
                         rtk_datas = b''
 

@@ -13,6 +13,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -25,6 +26,7 @@ setup(
         'console_scripts': [
             'f9p_driver = scripts.f9p_driver:main',
             'ichimill_connect = scripts.ichimill_connect:main',
+            'pointperfect_connect = scripts.pointperfect_connect:main',
             'ntripcaster_connect = scripts.ntripcaster_connect:main',
             'fix2csv = scripts.fix2csv:main',
         ],
