@@ -142,7 +142,7 @@ class PointPerfectConnectNode(Node):
         self.declare_parameter('ntrip_use_tls', True)
         # NEAR-* マウントポイントは位置に応じたタイルを配信するため GGA が要る
         self.declare_parameter('gga_topic', '/nmea_gga')
-        self.declare_parameter('gga_interval_sec', 10.0)
+        self.declare_parameter('gga_interval_sec', 5.0)
         # 測位解 (GGA) が出るまでキャスタへ接続しない。NEAR-* は位置が
         # 届くまで配信を始めず、数秒でキャスタ側から切断されるため。
         # 位置に依存しないマウントポイントを使う場合のみ false にする。
@@ -150,6 +150,8 @@ class PointPerfectConnectNode(Node):
         # この秒数より古い GGA は「測位を失った」とみなす。古い位置を
         # 送り続けてもキャスタは配信を止めるため、待ち状態へ戻す。
         self.declare_parameter('gga_timeout_sec', 30.0)
+        # この秒数、補正データが届かなければ接続を張り直す
+        self.declare_parameter('data_timeout_sec', 30.0)
         self.declare_parameter('reconnect_interval_sec', 5.0)
 
         # --- MQTT 配信 ---
@@ -182,6 +184,7 @@ class PointPerfectConnectNode(Node):
         self.gga_interval = get('gga_interval_sec').get_parameter_value().double_value
         self.require_gga = get('require_gga').get_parameter_value().bool_value
         self.gga_timeout = get('gga_timeout_sec').get_parameter_value().double_value
+        self.data_timeout = get('data_timeout_sec').get_parameter_value().double_value
         self.reconnect_interval = get('reconnect_interval_sec').get_parameter_value().double_value
 
         self.host = get('host').get_parameter_value().string_value
@@ -259,7 +262,7 @@ class PointPerfectConnectNode(Node):
             f"Ntrip-Version: Ntrip/2.0\r\n"
             f"User-Agent: {CLIENT_AGENT}\r\n"
             f"Authorization: Basic {credential}\r\n"
-            f"Connection: close\r\n\r\n"
+            f"\r\n"
         ).encode('ascii')
 
     def connect_ntrip(self):
@@ -307,6 +310,10 @@ class PointPerfectConnectNode(Node):
             else:
                 self.get_logger().error(f"NTRIP Caster ResponseError!! : {status_line}")
             return None
+
+        # ヘッダ受信後は短いタイムアウトにする。recv をブロックさせたままに
+        # すると GGA の定期送信がデータ到着に引きずられてしまう。
+        sock.settimeout(1.0)
 
         chunked = "chunked" in head_text.lower()
         decoder = ChunkedDecoder() if chunked else None
@@ -379,6 +386,18 @@ class PointPerfectConnectNode(Node):
             time.sleep(1.0)
         return False
 
+    def log_session_end(self, reason: str, session_start: float, bytes_at_start: int):
+        """切断時にセッションの継続時間と受信量を残す。
+
+        データが流れていたのに切られたのか、無言のまま切られたのかを
+        後から切り分けられるようにする。
+        """
+        elapsed = time.monotonic() - session_start
+        received = self.correction_bytes_total - bytes_at_start
+        self.get_logger().warn(
+            f"{reason} after {elapsed:.1f} s ({received} bytes received "
+            f"in this session). Reconnecting...")
+
     def ntrip_loop(self):
         """接続・受信・再接続を行うワーカースレッド。"""
         while self.running and rclpy.ok():
@@ -403,29 +422,33 @@ class PointPerfectConnectNode(Node):
                 if leftover:
                     self.publish_payload(decoder.feed(leftover) if decoder else leftover)
 
-                idle_count = 0
+                session_start = time.monotonic()
+                session_bytes = self.correction_bytes_total
+                last_data = time.monotonic()
+
                 while self.running and rclpy.ok():
                     try:
                         data = sock.recv(RECV_SIZE)
                     except socket.timeout:
-                        idle_count += 1
-                        self.get_logger().warn(
-                            "NTRIP Caster is silent. Retrying..." if idle_count >= 2
-                            else "NTRIP Caster timeout.")
-                        # 位置が未送信だと配信が始まらないので送り直す
-                        if not self.send_gga_if_due(force=True):
+                        data = None
+                    else:
+                        if not data:
+                            self.log_session_end(
+                                "NTRIP Caster disconnected",
+                                session_start, session_bytes)
                             break
-                        if idle_count >= 3:
-                            break
-                        continue
+                        last_data = time.monotonic()
+                        self.publish_payload(decoder.feed(data) if decoder else data)
 
-                    if not data:
-                        self.get_logger().warn("NTRIP Caster disconnected. Reconnecting...")
+                    # GGA の送信はデータ到着とは独立に時間で判断する。
+                    # 受信が止まっている間こそ位置を送り続ける必要がある。
+                    if not self.send_gga_if_due():
                         break
 
-                    idle_count = 0
-                    self.publish_payload(decoder.feed(data) if decoder else data)
-                    if not self.send_gga_if_due():
+                    if time.monotonic() - last_data > self.data_timeout:
+                        self.log_session_end(
+                            f"No correction data for {self.data_timeout:.0f} s",
+                            session_start, session_bytes)
                         break
 
             except (OSError, ValueError, ConnectionError) as ex:
