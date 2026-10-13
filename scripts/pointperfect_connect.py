@@ -143,10 +143,9 @@ class PointPerfectConnectNode(Node):
         # NEAR-* マウントポイントは位置に応じたタイルを配信するため GGA が要る
         self.declare_parameter('gga_topic', '/nmea_gga')
         self.declare_parameter('gga_interval_sec', 5.0)
-        # 測位解 (GGA) が出るまでキャスタへ接続しない。NEAR-* は位置が
-        # 届くまで配信を始めず、数秒でキャスタ側から切断されるため。
-        # 位置に依存しないマウントポイントを使う場合のみ false にする。
-        self.declare_parameter('require_gga', True)
+        # 接続前に GGA を待つか。PointPerfect の NEAR-* は位置が無くても
+        # 配信を始めるため既定では待たない (u-center と同じ挙動)。
+        self.declare_parameter('require_gga', False)
         # この秒数より古い GGA は「測位を失った」とみなす。古い位置を
         # 送り続けてもキャスタは配信を止めるため、待ち状態へ戻す。
         self.declare_parameter('gga_timeout_sec', 30.0)
@@ -232,15 +231,19 @@ class PointPerfectConnectNode(Node):
     # NTRIP 配信
     # ======================================================================
     def cb_gga(self, msg: Sentence):
-        """受信機の GGA を保持する。キャスタへの送信は受信スレッドが行う。"""
+        """受信機の GGA を保持する。キャスタへの送信は受信スレッドが行う。
+
+        測位できていない GGA (緯度経度が空) もそのまま保持して送る。
+        PointPerfect の NEAR-* マウントポイントは位置が無くても配信を
+        始めるため、u-center も同様に中身を問わず送っている。
+        """
         sentence = msg.sentence.strip()
         if not sentence.startswith('$'):
             return
-        if sentence.split(',').count('') > 1:
-            self.get_logger().warn(
-                f"Missing the necessary elements in GGA sentence: {sentence}",
-                throttle_duration_sec=10.0)
-            return
+        if self.debug and sentence.split(',').count('') > 1:
+            self.get_logger().info(
+                f"GGA has no position yet (sent anyway): {sentence}",
+                throttle_duration_sec=30.0)
         self.latest_gga = sentence + "\r\n"
         self.latest_gga_time = time.monotonic()
 
@@ -335,16 +338,15 @@ class PointPerfectConnectNode(Node):
                 self.gga_warned = True
                 self.get_logger().warn(
                     f"No GGA received on {self.gga_topic} yet. "
-                    "NEAR-* mountpoints need the receiver position to start streaming.")
+                    "Connecting anyway; the caster streams without a position.")
             return True
 
         if not self.gga_is_fresh():
-            # 測位を失った。古い位置を送り続けてもキャスタは配信しない。
+            # 受信機から GGA が出てこなくなった状態。接続自体は維持する。
             self.get_logger().warn(
-                f"No valid GGA for {self.gga_timeout:.0f} s "
-                "(the receiver lost its fix). Waiting for a position again.",
+                f"No GGA from the receiver for {self.gga_timeout:.0f} s. "
+                "Still sending the last one.",
                 throttle_duration_sec=30.0)
-            return False
 
         now = time.monotonic()
         if not force and (now - self.last_gga_sent) < self.gga_interval:
@@ -377,8 +379,8 @@ class PointPerfectConnectNode(Node):
             return True
 
         self.get_logger().warn(
-            f"Waiting for a GGA fix on {self.gga_topic} before connecting. "
-            "NEAR-* mountpoints need the receiver position to start streaming.")
+            f"Waiting for a GGA on {self.gga_topic} before connecting "
+            "(require_gga is set).")
         while self.running and rclpy.ok():
             if self.gga_is_fresh():
                 self.get_logger().info("GGA received. Connecting to the caster.")

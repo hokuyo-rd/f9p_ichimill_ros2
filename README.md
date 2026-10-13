@@ -151,14 +151,15 @@ pointperfect_connect:
 ### GGAの送信について
 
 `NEAR-SPARTN` のような **NEAR-\*** マウントポイントは、受信機の位置に応じたタイルの
-補正を配信する。そのためクライアントからキャスタへ **GGAを送り続ける必要がある**。<br>
-本ノードは `f9p_driver` が発行する `/nmea_gga` を購読し、接続直後と `gga_interval_sec`
-(既定10秒) ごとにキャスタへ送信する。<br>
-測位できておらずGGAが出ていないと補正が始まらないため、その場合は次の警告を出す。
+補正を配信する。本ノードは `f9p_driver` が発行する `/nmea_gga` を購読し、接続直後と
+`gga_interval_sec` (既定5秒) ごとにキャスタへ送信する。
 
-```
-No GGA received on /nmea_gga yet. NEAR-* mountpoints need the receiver position to start streaming.
-```
+測位できていない空のGGA (`$GPGGA,072719.20,,,,,0,00,99.99,,,,,,*6E` のような形) も
+そのまま送る。**PointPerfectのキャスタは位置が無くても補正の配信を始める**ため、
+測位を待つ必要はない。u-centerのNTRIPクライアントも同じ挙動で、屋内・測位なしの
+状態で補正を受信できることを実機で確認している。
+
+測位を待ってから接続したい場合は `require_gga: true` にする。
 
 ### 動的キーは不要
 
