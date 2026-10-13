@@ -344,6 +344,15 @@ class F9PDriverNode(Node):
             "No configuration readback from the receiver (UBX-CFG-VALGET). "
             "Cannot verify whether SPARTN input is enabled.")
 
+    def poll_antenna_status(self):
+        """UBX-MON-RF を問い合わせる (出力設定キーに依存しない)。"""
+        if not self.enable_diagnostics:
+            return
+        try:
+            self.gps_serial.write(ubx.poll_request(ubx.UBX_CLASS_MON, ubx.UBX_MON_RF))
+        except serial.SerialTimeoutException:
+            pass
+
     def report_status(self):
         """測位品質と補正データの流量を定期的に出す。"""
         if self.status_interval <= 0.0:
@@ -365,6 +374,9 @@ class F9PDriverNode(Node):
             f"nmea={self.nmea_count} corrections={written} B/{self.status_interval:.0f}s "
             f"(total {self.correction_bytes_total} B)")
 
+        # 次回のステータスに間に合うよう、今のうちに問い合わせておく
+        self.poll_antenna_status()
+
         if self.antenna is not None:
             note = ""
             if self.antenna['ant_status'] == 'OPEN':
@@ -375,6 +387,10 @@ class F9PDriverNode(Node):
                 f"  Antenna: status={self.antenna['ant_status']} "
                 f"power={self.antenna['ant_power']} agc={self.antenna['agc']} "
                 f"noise={self.antenna['noise']} jamming={self.antenna['jamming']}{note}")
+
+        else:
+            self.get_logger().info(
+                "  Antenna: no UBX-MON-RF response yet.")
 
         if self.sat_count:
             tracked = [c for c in self.sat_cnos if c > 0]
@@ -546,6 +562,7 @@ class F9PDriverNode(Node):
             if self.configure_receiver:
                 self.send_configuration()
 
+            self.poll_antenna_status()
             self.last_nmea_time = time.monotonic()
             self.last_status_time = time.monotonic()
             while rclpy.ok():

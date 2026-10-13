@@ -232,12 +232,11 @@ def parse_valget(payload: bytes):
 
 
 # --- 診断用メッセージの出力設定 ---------------------------------------------
-# アンテナ状態と衛星の信号強度を受信機から直接読むために使う。
+# 衛星の信号強度を読むために使う。
+# UBX-MON-RF (アンテナ状態) は出力設定に頼らず poll_request() で問い合わせる。
 MSGOUT_UBX_KEYS = {
     "nav_sat": {"i2c": 0x20910015, "uart1": 0x20910016, "uart2": 0x20910017,
                 "usb": 0x20910018, "spi": 0x20910019},
-    "mon_rf":  {"i2c": 0x20910359, "uart1": 0x2091035A, "uart2": 0x2091035B,
-                "usb": 0x2091035C, "spi": 0x2091035D},
 }
 
 ANT_STATUS = {0: "INIT", 1: "DONTKNOW", 2: "OK", 3: "SHORT", 4: "OPEN"}
@@ -281,3 +280,12 @@ def parse_nav_sat(payload: bytes):
             break
         cnos.append(payload[offset + 2])
     return num_svs, cnos
+
+
+def poll_request(msg_class: int, msg_id: int) -> bytes:
+    """UBX の問い合わせフレーム (ペイロード長 0) を生成する。
+
+    出力設定キーを書き換えずに単発で値を取得できるため、
+    キーIDの差異に左右されない。
+    """
+    return build_frame(msg_class, msg_id)
