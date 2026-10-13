@@ -148,6 +148,7 @@ class F9PDriverNode(Node):
         self.valget_sent_time = 0.0
         self.valset_labels = []
         self.antenna = None
+        self.antenna_source = None
         self.sat_count = 0
         self.sat_cnos = []
 
@@ -345,13 +346,20 @@ class F9PDriverNode(Node):
             "Cannot verify whether SPARTN input is enabled.")
 
     def poll_antenna_status(self):
-        """UBX-MON-RF を問い合わせる (出力設定キーに依存しない)。"""
+        """アンテナ状態を問い合わせる (出力設定キーに依存しない)。
+
+        MON-RF に応答しない FW があるため、旧来の MON-HW も併せて問い合わせる。
+        """
         if not self.enable_diagnostics:
             return
-        try:
-            self.gps_serial.write(ubx.poll_request(ubx.UBX_CLASS_MON, ubx.UBX_MON_RF))
-        except serial.SerialTimeoutException:
-            pass
+        for msg_id in (ubx.UBX_MON_RF, ubx.UBX_MON_HW):
+            try:
+                self.gps_serial.write(ubx.poll_request(ubx.UBX_CLASS_MON, msg_id))
+            except serial.SerialTimeoutException:
+                self.get_logger().warn(
+                    "Timed out while polling the antenna status.",
+                    throttle_duration_sec=30.0)
+                return
 
     def report_status(self):
         """測位品質と補正データの流量を定期的に出す。"""
@@ -384,13 +392,13 @@ class F9PDriverNode(Node):
             elif self.antenna['ant_status'] == 'SHORT':
                 note = "  <- antenna short circuit."
             self.get_logger().info(
-                f"  Antenna: status={self.antenna['ant_status']} "
+                f"  Antenna[{self.antenna_source}]: status={self.antenna['ant_status']} "
                 f"power={self.antenna['ant_power']} agc={self.antenna['agc']} "
                 f"noise={self.antenna['noise']} jamming={self.antenna['jamming']}{note}")
 
         else:
             self.get_logger().info(
-                "  Antenna: no UBX-MON-RF response yet.")
+                "  Antenna: no response to UBX-MON-RF / UBX-MON-HW polls.")
 
         if self.sat_count:
             tracked = [c for c in self.sat_cnos if c > 0]
@@ -461,6 +469,13 @@ class F9PDriverNode(Node):
             blocks = ubx.parse_mon_rf(payload)
             if blocks:
                 self.antenna = blocks[0]
+                self.antenna_source = 'MON-RF'
+        elif msg_class == ubx.UBX_CLASS_MON and msg_id == ubx.UBX_MON_HW:
+            # MON-RF が応答した場合はそちらを優先する
+            info = ubx.parse_mon_hw(payload)
+            if info and self.antenna_source != 'MON-RF':
+                self.antenna = info
+                self.antenna_source = 'MON-HW'
         elif msg_class == ubx.UBX_CLASS_NAV and msg_id == ubx.UBX_NAV_SAT:
             self.sat_count, self.sat_cnos = ubx.parse_nav_sat(payload)
         elif msg_class == ubx.UBX_CLASS_CFG and msg_id == ubx.UBX_CFG_VALGET:

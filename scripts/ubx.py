@@ -32,6 +32,7 @@ UBX_RXM_SPARTNKEY = 0x36
 UBX_RXM_SPARTN = 0x33
 UBX_NAV_SAT = 0x35
 UBX_MON_RF = 0x38
+UBX_MON_HW = 0x09
 
 # --- 設定レイヤ --------------------------------------------------------------
 LAYER_RAM = 0x01
@@ -289,3 +290,20 @@ def poll_request(msg_class: int, msg_id: int) -> bytes:
     キーIDの差異に左右されない。
     """
     return build_frame(msg_class, msg_id)
+
+
+def parse_mon_hw(payload: bytes):
+    """UBX-MON-HW からアンテナ状態を取り出す (MON-RF が使えない FW 向け)。
+
+    MON-RF より古いメッセージだが aStatus / aPower の意味は同じ。
+    """
+    if len(payload) < 46:
+        return None
+    return {
+        "id": 0,
+        "ant_status": ANT_STATUS.get(payload[20], str(payload[20])),
+        "ant_power": ANT_POWER.get(payload[21], str(payload[21])),
+        "noise": struct.unpack("<H", payload[16:18])[0],
+        "agc": struct.unpack("<H", payload[18:20])[0],
+        "jamming": payload[45],
+    }
