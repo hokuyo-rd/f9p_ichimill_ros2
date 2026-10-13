@@ -29,6 +29,7 @@ setup(
             'pointperfect_connect = scripts.pointperfect_connect:main',
             'ntripcaster_connect = scripts.ntripcaster_connect:main',
             'fix2csv = scripts.fix2csv:main',
+            'gnss_check = scripts.gnss_check:main',
         ],
     },
 )
