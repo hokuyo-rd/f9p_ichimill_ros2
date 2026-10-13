@@ -143,6 +143,10 @@ class PointPerfectConnectNode(Node):
         # NEAR-* マウントポイントは位置に応じたタイルを配信するため GGA が要る
         self.declare_parameter('gga_topic', '/nmea_gga')
         self.declare_parameter('gga_interval_sec', 10.0)
+        # 測位解 (GGA) が出るまでキャスタへ接続しない。NEAR-* は位置が
+        # 届くまで配信を始めず、数秒でキャスタ側から切断されるため。
+        # 位置に依存しないマウントポイントを使う場合のみ false にする。
+        self.declare_parameter('require_gga', True)
         self.declare_parameter('reconnect_interval_sec', 5.0)
 
         # --- MQTT 配信 ---
@@ -173,6 +177,7 @@ class PointPerfectConnectNode(Node):
         self.ntrip_use_tls = get('ntrip_use_tls').get_parameter_value().bool_value
         self.gga_topic = get('gga_topic').get_parameter_value().string_value
         self.gga_interval = get('gga_interval_sec').get_parameter_value().double_value
+        self.require_gga = get('require_gga').get_parameter_value().bool_value
         self.reconnect_interval = get('reconnect_interval_sec').get_parameter_value().double_value
 
         self.host = get('host').get_parameter_value().string_value
@@ -331,10 +336,32 @@ class PointPerfectConnectNode(Node):
             self.get_logger().info(f"Sent GGA to caster: {self.latest_gga.strip()}")
         return True
 
+    def wait_for_gga(self) -> bool:
+        """測位解が得られるまで接続を待つ。
+
+        NEAR-* マウントポイントは受信機位置が届くまで配信を始めず、
+        数秒でキャスタ側から接続を切られる。GGA が無いまま接続を
+        繰り返すとサーバを無駄に叩くだけなので、先に測位解を待つ。
+        """
+        if self.latest_gga is not None:
+            return True
+
+        self.get_logger().warn(
+            f"Waiting for a GGA fix on {self.gga_topic} before connecting. "
+            "NEAR-* mountpoints need the receiver position to start streaming.")
+        while self.running and rclpy.ok():
+            if self.latest_gga is not None:
+                self.get_logger().info("GGA received. Connecting to the caster.")
+                return True
+            time.sleep(1.0)
+        return False
+
     def ntrip_loop(self):
         """接続・受信・再接続を行うワーカースレッド。"""
         while self.running and rclpy.ok():
             decoder = None
+            if self.require_gga and not self.wait_for_gga():
+                break
             try:
                 self.get_logger().info(
                     f"PointPerfect NTRIP connecting to "
