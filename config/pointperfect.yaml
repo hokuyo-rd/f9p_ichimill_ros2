@@ -23,7 +23,18 @@ pointperfect_connect:
     # NEAR-* マウントポイントは受信機位置に応じたタイルを配信するため、
     # GGA をキャスタへ定期送信する必要がある。
     gga_topic: "/nmea_gga"
-    gga_interval_sec: 10.0
+    gga_interval_sec: 5.0
+    # 接続前に GGA を待つか。NEAR-* は位置が無くても配信されるので false
+    require_gga: false
+    # 受信機が測位できていないときにキャスタへ送る代替位置 [緯度, 経度, 標高]。
+    # NEAR-* は最初に受け取った位置でタイルを決めるため、未測位のまま新規に
+    # 接続すると配信が始まらないことがある。屋内で試す場合に設定する。
+    # [0.0, 0.0, 0.0] なら無効（受信機の GGA をそのまま送る）。
+    fallback_position: [0.0, 0.0, 0.0]
+    # これより古い GGA は測位喪失とみなし、接続待ちへ戻す
+    gga_timeout_sec: 30.0
+    # これだけ補正データが届かなければ接続を張り直す
+    data_timeout_sec: 30.0
     reconnect_interval_sec: 5.0
 
     # ================= MQTT 配信 (mode: mqtt) =================
