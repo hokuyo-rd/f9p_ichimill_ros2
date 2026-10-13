@@ -40,6 +40,26 @@ def calcultateCheckSum(stringToCheck):
     return "%02X" % xsum_calc
 
 
+def nmea_checksum_ok(sentence: str) -> bool:
+    """NMEA センテンスのチェックサムが正しいかを判定する。
+
+    取りこぼしや UBX バイナリの誤同期で壊れた行を購読側へ流さないために使う。
+    """
+    if not sentence.startswith('$'):
+        return False
+    star = sentence.rfind('*')
+    if star < 2 or len(sentence) - star < 3:
+        return False
+    try:
+        expected = int(sentence[star + 1:star + 3], 16)
+    except ValueError:
+        return False
+    actual = 0
+    for char in sentence[1:star]:
+        actual ^= ord(char)
+    return actual == expected
+
+
 class F9PDriverNode(Node):
     def __init__(self):
         super().__init__('f9p_driver')
@@ -100,6 +120,7 @@ class F9PDriverNode(Node):
 
         self.gps_serial = None
         self.rx_buffer = b""
+        self.invalid_nmea_count = 0
 
         self.get_logger().info(
             f"Correction data topic: {self.correction_topic} (interface={self.interface})")
@@ -203,11 +224,20 @@ class F9PDriverNode(Node):
                     break  # センテンスが未完成
                 line = self.rx_buffer[:index]
                 self.rx_buffer = self.rx_buffer[index + 1:]
+                # 取りこぼしや UBX バイナリの誤同期で先頭にゴミが残ることが
+                # あるため、行内の最後の '$' から切り出して同期を取り直す
+                start = line.rfind(b"$")
+                if start > 0:
+                    line = line[start:]
                 try:
-                    self.handle_nmea(line.decode('ascii').strip())
+                    sentence = line.decode('ascii').strip()
                 except UnicodeDecodeError:
-                    if self.debug:
-                        self.get_logger().warn("Dropped a non-ASCII NMEA line.")
+                    self.count_invalid_nmea()
+                    continue
+                if not nmea_checksum_ok(sentence):
+                    self.count_invalid_nmea(sentence)
+                    continue
+                self.handle_nmea(sentence)
                 continue
 
             # '$' でも UBX 同期文字でもない → 次の開始位置まで読み飛ばす
@@ -222,6 +252,16 @@ class F9PDriverNode(Node):
         if len(self.rx_buffer) > MAX_BUFFER_SIZE:
             self.get_logger().warn("Serial RX buffer overflow. Clearing.")
             self.rx_buffer = b""
+
+    def count_invalid_nmea(self, sentence: str = ''):
+        """チェックサム不正のセンテンスを数え、頻発していれば警告する。"""
+        self.invalid_nmea_count += 1
+        if self.debug and sentence:
+            self.get_logger().warn(f"Dropped a corrupt NMEA sentence: {sentence}")
+        self.get_logger().warn(
+            f"Dropped {self.invalid_nmea_count} corrupt NMEA sentences so far. "
+            "Check the baud rate and the NMEA output load on the receiver.",
+            throttle_duration_sec=30.0)
 
     def handle_ubx(self, msg_class: int, msg_id: int, payload: bytes):
         """受信機からの UBX メッセージを処理する (主に設定の ACK 確認)。"""

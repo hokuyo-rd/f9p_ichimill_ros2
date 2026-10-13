@@ -147,6 +147,9 @@ class PointPerfectConnectNode(Node):
         # 届くまで配信を始めず、数秒でキャスタ側から切断されるため。
         # 位置に依存しないマウントポイントを使う場合のみ false にする。
         self.declare_parameter('require_gga', True)
+        # この秒数より古い GGA は「測位を失った」とみなす。古い位置を
+        # 送り続けてもキャスタは配信を止めるため、待ち状態へ戻す。
+        self.declare_parameter('gga_timeout_sec', 30.0)
         self.declare_parameter('reconnect_interval_sec', 5.0)
 
         # --- MQTT 配信 ---
@@ -178,6 +181,7 @@ class PointPerfectConnectNode(Node):
         self.gga_topic = get('gga_topic').get_parameter_value().string_value
         self.gga_interval = get('gga_interval_sec').get_parameter_value().double_value
         self.require_gga = get('require_gga').get_parameter_value().bool_value
+        self.gga_timeout = get('gga_timeout_sec').get_parameter_value().double_value
         self.reconnect_interval = get('reconnect_interval_sec').get_parameter_value().double_value
 
         self.host = get('host').get_parameter_value().string_value
@@ -206,6 +210,7 @@ class PointPerfectConnectNode(Node):
         self.socket = None
         self.socket_lock = threading.Lock()
         self.latest_gga = None
+        self.latest_gga_time = 0.0
         self.last_gga_sent = 0.0
         self.gga_warned = False
         self.running = True
@@ -234,6 +239,16 @@ class PointPerfectConnectNode(Node):
                 throttle_duration_sec=10.0)
             return
         self.latest_gga = sentence + "\r\n"
+        self.latest_gga_time = time.monotonic()
+
+    def gga_is_fresh(self) -> bool:
+        """有効な測位解が今も得られているか。
+
+        受信機が測位を失うと GGA の必須項目が欠けるようになり cb_gga で
+        弾かれる。その場合 latest_gga は古いままなので、時刻で判定する。
+        """
+        return (self.latest_gga is not None
+                and (time.monotonic() - self.latest_gga_time) < self.gga_timeout)
 
     def build_ntrip_request(self) -> bytes:
         credential = base64.b64encode(
@@ -316,6 +331,14 @@ class PointPerfectConnectNode(Node):
                     "NEAR-* mountpoints need the receiver position to start streaming.")
             return True
 
+        if not self.gga_is_fresh():
+            # 測位を失った。古い位置を送り続けてもキャスタは配信しない。
+            self.get_logger().warn(
+                f"No valid GGA for {self.gga_timeout:.0f} s "
+                "(the receiver lost its fix). Waiting for a position again.",
+                throttle_duration_sec=30.0)
+            return False
+
         now = time.monotonic()
         if not force and (now - self.last_gga_sent) < self.gga_interval:
             return True
@@ -343,14 +366,14 @@ class PointPerfectConnectNode(Node):
         数秒でキャスタ側から接続を切られる。GGA が無いまま接続を
         繰り返すとサーバを無駄に叩くだけなので、先に測位解を待つ。
         """
-        if self.latest_gga is not None:
+        if self.gga_is_fresh():
             return True
 
         self.get_logger().warn(
             f"Waiting for a GGA fix on {self.gga_topic} before connecting. "
             "NEAR-* mountpoints need the receiver position to start streaming.")
         while self.running and rclpy.ok():
-            if self.latest_gga is not None:
+            if self.gga_is_fresh():
                 self.get_logger().info("GGA received. Connecting to the caster.")
                 return True
             time.sleep(1.0)
