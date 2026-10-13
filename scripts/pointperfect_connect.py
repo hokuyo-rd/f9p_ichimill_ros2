@@ -146,6 +146,10 @@ class PointPerfectConnectNode(Node):
         # 接続前に GGA を待つか。PointPerfect の NEAR-* は位置が無くても
         # 配信を始めるため既定では待たない (u-center と同じ挙動)。
         self.declare_parameter('require_gga', False)
+        # 受信機が測位できていないときにキャスタへ送る代替位置 [緯度, 経度, 標高]。
+        # NEAR-* は最初に有効な位置を受け取ってタイルを決めるため、未測位の
+        # まま新規に接続すると配信が始まらないことがある。空なら無効。
+        self.declare_parameter('fallback_position', [0.0, 0.0, 0.0])
         # この秒数より古い GGA は「測位を失った」とみなす。古い位置を
         # 送り続けてもキャスタは配信を止めるため、待ち状態へ戻す。
         self.declare_parameter('gga_timeout_sec', 30.0)
@@ -182,6 +186,13 @@ class PointPerfectConnectNode(Node):
         self.gga_topic = get('gga_topic').get_parameter_value().string_value
         self.gga_interval = get('gga_interval_sec').get_parameter_value().double_value
         self.require_gga = get('require_gga').get_parameter_value().bool_value
+        position = list(get('fallback_position').get_parameter_value().double_array_value)
+        self.fallback_gga = None
+        if len(position) >= 2 and (position[0] or position[1]):
+            altitude = position[2] if len(position) > 2 else 0.0
+            self.fallback_position = (position[0], position[1], altitude)
+        else:
+            self.fallback_position = None
         self.gga_timeout = get('gga_timeout_sec').get_parameter_value().double_value
         self.data_timeout = get('data_timeout_sec').get_parameter_value().double_value
         self.reconnect_interval = get('reconnect_interval_sec').get_parameter_value().double_value
@@ -246,6 +257,42 @@ class PointPerfectConnectNode(Node):
                 throttle_duration_sec=30.0)
         self.latest_gga = sentence + "\r\n"
         self.latest_gga_time = time.monotonic()
+
+    @staticmethod
+    def build_gga(latitude: float, longitude: float, altitude: float) -> str:
+        """緯度経度から有効な GGA センテンスを組み立てる。"""
+        now = time.gmtime()
+        hhmmss = f"{now.tm_hour:02d}{now.tm_min:02d}{now.tm_sec:02d}.00"
+        lat_hemi = 'N' if latitude >= 0 else 'S'
+        lon_hemi = 'E' if longitude >= 0 else 'W'
+        lat, lon = abs(latitude), abs(longitude)
+        lat_field = f"{int(lat):02d}{(lat - int(lat)) * 60:08.5f}"
+        lon_field = f"{int(lon):03d}{(lon - int(lon)) * 60:08.5f}"
+        body = (f"GPGGA,{hhmmss},{lat_field},{lat_hemi},{lon_field},{lon_hemi},"
+                f"1,12,1.0,{altitude:.1f},M,0.0,M,,")
+        checksum = 0
+        for char in body:
+            checksum ^= ord(char)
+        return f"${body}*{checksum:02X}\r\n"
+
+    @staticmethod
+    def gga_has_position(sentence: str) -> bool:
+        """GGA に緯度経度が入っているか。"""
+        fields = sentence.split(',')
+        return len(fields) > 5 and bool(fields[2]) and bool(fields[4])
+
+    def gga_to_send(self):
+        """キャスタへ送る GGA を選ぶ。
+
+        受信機が測位していればそれを使う。測位していない場合、代替位置が
+        設定されていればそちらを送る。NEAR-* は最初の位置でタイルを決める
+        ため、未測位のまま新規接続すると配信が始まらないことがあるため。
+        """
+        if self.latest_gga is not None and self.gga_has_position(self.latest_gga):
+            return self.latest_gga, 'receiver'
+        if self.fallback_position is not None:
+            return self.build_gga(*self.fallback_position), 'fallback'
+        return self.latest_gga, 'receiver'
 
     def gga_is_fresh(self) -> bool:
         """有効な測位解が今も得られているか。
@@ -333,7 +380,7 @@ class PointPerfectConnectNode(Node):
         するまで数十秒気づけないため、送信失敗を接続断とみなして即座に
         張り直せるようにしている。
         """
-        if self.latest_gga is None:
+        if self.latest_gga is None and self.fallback_position is None:
             if not self.gga_warned:
                 self.gga_warned = True
                 self.get_logger().warn(
@@ -352,11 +399,15 @@ class PointPerfectConnectNode(Node):
         if not force and (now - self.last_gga_sent) < self.gga_interval:
             return True
 
+        sentence, source = self.gga_to_send()
+        if sentence is None:
+            return True
+
         with self.socket_lock:
             if self.socket is None:
                 return False
             try:
-                self.socket.sendall(self.latest_gga.encode('ascii'))
+                self.socket.sendall(sentence.encode('ascii'))
             except OSError as ex:
                 if self.running and rclpy.ok():
                     self.get_logger().warn(
@@ -365,7 +416,7 @@ class PointPerfectConnectNode(Node):
                 return False
         self.last_gga_sent = now
         if self.debug:
-            self.get_logger().info(f"Sent GGA to caster: {self.latest_gga.strip()}")
+            self.get_logger().info(f"Sent GGA to caster ({source}): {sentence.strip()}")
         return True
 
     def wait_for_gga(self) -> bool:
