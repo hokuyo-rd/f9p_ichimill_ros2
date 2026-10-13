@@ -13,6 +13,7 @@
 """
 
 import threading
+import time
 from collections import deque
 
 import serial
@@ -86,6 +87,10 @@ class F9PDriverNode(Node):
         self.declare_parameter('nav_rate_hz', 5.0)
         # 有効化する NMEA センテンス
         self.declare_parameter('nmea_sentences', ['gga', 'zda', 'rmc'])
+        # シリアル書き込みのタイムアウト [s]
+        self.declare_parameter('write_timeout_sec', 2.0)
+        # この秒数 NMEA が来なければ警告する
+        self.declare_parameter('silence_warn_sec', 5.0)
 
         self.serial_port = self.get_parameter('port').get_parameter_value().string_value
         self.serial_baud = self.get_parameter('baud').get_parameter_value().integer_value
@@ -98,6 +103,8 @@ class F9PDriverNode(Node):
         self.nav_rate_hz = self.get_parameter('nav_rate_hz').get_parameter_value().double_value
         self.nmea_sentences = [s.lower() for s in
                                self.get_parameter('nmea_sentences').get_parameter_value().string_array_value]
+        self.write_timeout = self.get_parameter('write_timeout_sec').get_parameter_value().double_value
+        self.silence_warn = self.get_parameter('silence_warn_sec').get_parameter_value().double_value
 
         if self.interface not in ubx.INPROT_KEYS:
             self.get_logger().warn(
@@ -121,6 +128,7 @@ class F9PDriverNode(Node):
         self.gps_serial = None
         self.rx_buffer = b""
         self.invalid_nmea_count = 0
+        self.last_nmea_time = 0.0
 
         self.get_logger().info(
             f"Correction data topic: {self.correction_topic} (interface={self.interface})")
@@ -191,9 +199,16 @@ class F9PDriverNode(Node):
             f"nav_rate={self.nav_rate_hz} Hz, spartn_source={self.spartn_source}, "
             f"nmea={self.nmea_sentences}")
         for frame in frames:
-            self.gps_serial.write(frame)
-            self.gps_serial.flush()
-        self.pending_valset = len(frames)
+            # flush() は tcdrain() を呼び送信完了まで無期限に待つため使わない
+            try:
+                self.gps_serial.write(frame)
+            except serial.SerialTimeoutException:
+                self.get_logger().error(
+                    "Timed out while writing the configuration to the receiver. "
+                    "Check the serial connection.")
+                return
+        self.get_logger().info(
+            "Configuration sent. Waiting for UBX-ACK-ACK from the receiver...")
 
     # --- シリアル受信 -------------------------------------------------------
     def read_serial(self):
@@ -253,6 +268,23 @@ class F9PDriverNode(Node):
             self.get_logger().warn("Serial RX buffer overflow. Clearing.")
             self.rx_buffer = b""
 
+    def check_receiver_silence(self):
+        """受信機から NMEA が来ていないことを可視化する。
+
+        無言のまま止まっていると原因の切り分けができないため、
+        一定時間データが無ければ警告を出す。
+        """
+        if self.silence_warn <= 0.0:
+            return
+        silent = time.monotonic() - self.last_nmea_time
+        if silent < self.silence_warn:
+            return
+        self.get_logger().warn(
+            f"No NMEA received from the receiver for {silent:.0f} s. "
+            f"Check that the receiver outputs NMEA on {self.interface} "
+            "and that no other process is holding the serial port.",
+            throttle_duration_sec=10.0)
+
     def count_invalid_nmea(self, sentence: str = ''):
         """チェックサム不正のセンテンスを数え、頻発していれば警告する。"""
         self.invalid_nmea_count += 1
@@ -287,6 +319,8 @@ class F9PDriverNode(Node):
         """NMEA センテンスを対応するトピックへ発行する。"""
         if not gps_str:
             return
+
+        self.last_nmea_time = time.monotonic()
 
         if self.debug:
             self.get_logger().info(f"Received: {gps_str}")
@@ -331,7 +365,13 @@ class F9PDriverNode(Node):
             payload = b"".join(self.correction_queue)
             self.correction_queue.clear()
 
-        self.gps_serial.write(payload)
+        try:
+            self.gps_serial.write(payload)
+        except serial.SerialTimeoutException:
+            self.get_logger().warn(
+                "Timed out while writing correction data to the receiver.",
+                throttle_duration_sec=10.0)
+            return
         self.correction_bytes_total += len(payload)
         if self.debug:
             self.get_logger().info(
@@ -342,8 +382,11 @@ class F9PDriverNode(Node):
     def run(self):
         try:
             self.get_logger().info("Serial port opening...")
+            # timeout は読み込み専用。write_timeout を指定しないと書き込みが
+            # 無期限にブロックし、ドライバ全体が停止する。
             self.gps_serial = serial.Serial(
-                port=self.serial_port, baudrate=self.serial_baud, timeout=0.1)
+                port=self.serial_port, baudrate=self.serial_baud,
+                timeout=0.1, write_timeout=self.write_timeout)
             self.get_logger().info(
                 f"OK. Port: {self.serial_port}, Baudrate: {self.serial_baud}")
         except serial.SerialException as ex:
@@ -357,10 +400,12 @@ class F9PDriverNode(Node):
             if self.configure_receiver:
                 self.send_configuration()
 
+            self.last_nmea_time = time.monotonic()
             while rclpy.ok():
                 executor.spin_once(timeout_sec=0.0)
                 self.read_serial()
                 self.write_corrections()
+                self.check_receiver_silence()
 
         except serial.SerialException as ex:
             self.get_logger().error(f"SerialException error: {ex}")
