@@ -20,6 +20,7 @@ UBX_CLASS_NAV = 0x01
 UBX_CLASS_RXM = 0x02
 UBX_CLASS_ACK = 0x05
 UBX_CLASS_CFG = 0x06
+UBX_CLASS_MON = 0x0A
 
 UBX_ACK_NAK = 0x00
 UBX_ACK_ACK = 0x01
@@ -29,6 +30,8 @@ UBX_CFG_VALGET = 0x8B
 # PointPerfect の MQTT トピック "/pp/ubx/0236/ip" の 0236 はこのクラス/IDを表す。
 UBX_RXM_SPARTNKEY = 0x36
 UBX_RXM_SPARTN = 0x33
+UBX_NAV_SAT = 0x35
+UBX_MON_RF = 0x38
 
 # --- 設定レイヤ --------------------------------------------------------------
 LAYER_RAM = 0x01
@@ -226,3 +229,55 @@ def parse_valget(payload: bytes):
         results.append((key, struct.unpack(fmt, payload[index:index + size])[0]))
         index += size
     return results
+
+
+# --- 診断用メッセージの出力設定 ---------------------------------------------
+# アンテナ状態と衛星の信号強度を受信機から直接読むために使う。
+MSGOUT_UBX_KEYS = {
+    "nav_sat": {"i2c": 0x20910015, "uart1": 0x20910016, "uart2": 0x20910017,
+                "usb": 0x20910018, "spi": 0x20910019},
+    "mon_rf":  {"i2c": 0x20910359, "uart1": 0x2091035A, "uart2": 0x2091035B,
+                "usb": 0x2091035C, "spi": 0x2091035D},
+}
+
+ANT_STATUS = {0: "INIT", 1: "DONTKNOW", 2: "OK", 3: "SHORT", 4: "OPEN"}
+ANT_POWER = {0: "OFF", 1: "ON", 2: "DONTKNOW"}
+
+
+def parse_mon_rf(payload: bytes):
+    """UBX-MON-RF から RF ブロックごとの状態を取り出す。
+
+    antStatus が OPEN ならアンテナが接続されていない、SHORT なら短絡。
+    agcCnt と jamInd は受信環境の指標。
+    """
+    if len(payload) < 4:
+        return []
+    blocks = []
+    for index in range(payload[1]):
+        offset = 4 + index * 24
+        if offset + 24 > len(payload):
+            break
+        block = payload[offset:offset + 24]
+        blocks.append({
+            "id": block[0],
+            "ant_status": ANT_STATUS.get(block[2], str(block[2])),
+            "ant_power": ANT_POWER.get(block[3], str(block[3])),
+            "noise": struct.unpack("<H", block[12:14])[0],
+            "agc": struct.unpack("<H", block[14:16])[0],
+            "jamming": block[16],
+        })
+    return blocks
+
+
+def parse_nav_sat(payload: bytes):
+    """UBX-NAV-SAT から衛星数と C/N0 の一覧を取り出す。"""
+    if len(payload) < 8:
+        return 0, []
+    num_svs = payload[5]
+    cnos = []
+    for index in range(num_svs):
+        offset = 8 + index * 12
+        if offset + 12 > len(payload):
+            break
+        cnos.append(payload[offset + 2])
+    return num_svs, cnos

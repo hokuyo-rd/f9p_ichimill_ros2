@@ -95,6 +95,9 @@ class F9PDriverNode(Node):
         self.declare_parameter('verify_configuration', True)
         # 測位品質と補正データ流量を定期的に出す間隔 [s] (0 で無効)
         self.declare_parameter('status_interval_sec', 10.0)
+        # UBX-MON-RF / UBX-NAV-SAT を有効化してアンテナ状態と衛星の
+        # 信号強度を読む。測位できない原因の切り分けに使う。
+        self.declare_parameter('enable_diagnostics', True)
 
         self.serial_port = self.get_parameter('port').get_parameter_value().string_value
         self.serial_baud = self.get_parameter('baud').get_parameter_value().integer_value
@@ -111,6 +114,7 @@ class F9PDriverNode(Node):
         self.silence_warn = self.get_parameter('silence_warn_sec').get_parameter_value().double_value
         self.verify_configuration = self.get_parameter('verify_configuration').get_parameter_value().bool_value
         self.status_interval = self.get_parameter('status_interval_sec').get_parameter_value().double_value
+        self.enable_diagnostics = self.get_parameter('enable_diagnostics').get_parameter_value().bool_value
 
         if self.interface not in ubx.INPROT_KEYS:
             self.get_logger().warn(
@@ -142,6 +146,10 @@ class F9PDriverNode(Node):
         self.status_bytes_mark = 0
         self.valget_pending = False
         self.valget_sent_time = 0.0
+        self.valset_labels = []
+        self.antenna = None
+        self.sat_count = 0
+        self.sat_cnos = []
 
         self.get_logger().info(
             f"Correction data topic: {self.correction_topic} (interface={self.interface})")
@@ -211,6 +219,7 @@ class F9PDriverNode(Node):
             f"Configuring receiver: {len(key_values)} items, "
             f"nav_rate={self.nav_rate_hz} Hz, spartn_source={self.spartn_source}, "
             f"nmea={self.nmea_sentences}")
+        self.valset_labels = ['main'] * len(frames)
         for frame in frames:
             # flush() は tcdrain() を呼び送信完了まで無期限に待つため使わない
             try:
@@ -222,6 +231,18 @@ class F9PDriverNode(Node):
                 return
         self.get_logger().info(
             "Configuration sent. Waiting for UBX-ACK-ACK from the receiver...")
+
+        if self.enable_diagnostics:
+            # 診断用メッセージは別フレームで送る。キーが受け付けられなくても
+            # 本体の設定まで巻き添えで拒否されないようにするため。
+            diag = [(ports[self.interface], 5)
+                    for ports in ubx.MSGOUT_UBX_KEYS.values()
+                    if self.interface in ports]
+            try:
+                self.gps_serial.write(ubx.build_valset(diag, layers=self._parse_layers()))
+                self.valset_labels.append('diagnostics')
+            except serial.SerialTimeoutException:
+                self.get_logger().warn("Timed out while enabling the diagnostic messages.")
 
         if self.verify_configuration:
             # 投入した値が実際に効いているかを受信機から読み戻す。
@@ -344,6 +365,26 @@ class F9PDriverNode(Node):
             f"nmea={self.nmea_count} corrections={written} B/{self.status_interval:.0f}s "
             f"(total {self.correction_bytes_total} B)")
 
+        if self.antenna is not None:
+            note = ""
+            if self.antenna['ant_status'] == 'OPEN':
+                note = "  <- no antenna current. Check the antenna and its power."
+            elif self.antenna['ant_status'] == 'SHORT':
+                note = "  <- antenna short circuit."
+            self.get_logger().info(
+                f"  Antenna: status={self.antenna['ant_status']} "
+                f"power={self.antenna['ant_power']} agc={self.antenna['agc']} "
+                f"noise={self.antenna['noise']} jamming={self.antenna['jamming']}{note}")
+
+        if self.sat_count:
+            tracked = [c for c in self.sat_cnos if c > 0]
+            strong = [c for c in self.sat_cnos if c >= 35]
+            best = max(self.sat_cnos) if self.sat_cnos else 0
+            note = "" if tracked else "  <- no signal at all. The antenna sees nothing."
+            self.get_logger().info(
+                f"  Signals: {self.sat_count} in view, {len(tracked)} with C/N0>0, "
+                f"{len(strong)} >=35 dBHz, best={best} dBHz{note}")
+
     def check_receiver_silence(self):
         """受信機から NMEA が来ていないことを可視化する。
 
@@ -376,8 +417,15 @@ class F9PDriverNode(Node):
         if msg_class == ubx.UBX_CLASS_ACK and len(payload) >= 2:
             acked_class, acked_id = payload[0], payload[1]
             if acked_class == ubx.UBX_CLASS_CFG and acked_id == ubx.UBX_CFG_VALSET:
+                # ACK は送った順に返るのでラベルを先頭から対応させる
+                label = self.valset_labels.pop(0) if self.valset_labels else 'unknown'
                 if msg_id == ubx.UBX_ACK_ACK:
-                    self.get_logger().info("Receiver configuration accepted (UBX-ACK-ACK).")
+                    self.get_logger().info(
+                        f"Receiver configuration accepted (UBX-ACK-ACK, {label}).")
+                elif label == 'diagnostics':
+                    self.get_logger().warn(
+                        "Receiver rejected the diagnostic messages (UBX-ACK-NAK). "
+                        "Antenna status will not be available; the main configuration is unaffected.")
                 else:
                     self.get_logger().error(
                         "Receiver rejected the configuration (UBX-ACK-NAK). "
@@ -393,6 +441,12 @@ class F9PDriverNode(Node):
                 self.get_logger().info(
                     f"UBX-ACK-{'ACK' if msg_id else 'NAK'} for 0x{acked_class:02x}"
                     f" 0x{acked_id:02x}")
+        elif msg_class == ubx.UBX_CLASS_MON and msg_id == ubx.UBX_MON_RF:
+            blocks = ubx.parse_mon_rf(payload)
+            if blocks:
+                self.antenna = blocks[0]
+        elif msg_class == ubx.UBX_CLASS_NAV and msg_id == ubx.UBX_NAV_SAT:
+            self.sat_count, self.sat_cnos = ubx.parse_nav_sat(payload)
         elif msg_class == ubx.UBX_CLASS_CFG and msg_id == ubx.UBX_CFG_VALGET:
             self.valget_pending = False
             self.report_configuration(payload)
