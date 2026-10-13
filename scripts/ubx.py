@@ -24,6 +24,7 @@ UBX_CLASS_CFG = 0x06
 UBX_ACK_NAK = 0x00
 UBX_ACK_ACK = 0x01
 UBX_CFG_VALSET = 0x8A
+UBX_CFG_VALGET = 0x8B
 # UBX-RXM-SPARTNKEY は CFG クラス (0x06 0x36) に定義されている。
 # PointPerfect の MQTT トピック "/pp/ubx/0236/ip" の 0236 はこのクラス/IDを表す。
 UBX_RXM_SPARTNKEY = 0x36
@@ -175,3 +176,53 @@ def is_ubx_frame(data: bytes) -> bool:
         return False
     ck_a, ck_b = checksum(data[2:6 + length])
     return (ck_a, ck_b) == (data[6 + length], data[7 + length])
+
+
+# --- 設定キーの名前（ログ表示用） -------------------------------------------
+def key_name(key: int) -> str:
+    """設定キーIDから分かりやすい名前を引く。未知なら 16 進で返す。"""
+    for iface, keys in INPROT_KEYS.items():
+        for proto, k in zip(("UBX", "NMEA", "RTCM3X", "SPARTN"), keys):
+            if k == key:
+                return f"CFG-{iface.upper()}INPROT-{proto}"
+    for sentence, ports in MSGOUT_NMEA_KEYS.items():
+        for iface, k in ports.items():
+            if k == key:
+                return f"CFG-MSGOUT-NMEA_ID_{sentence.upper()}_{iface.upper()}"
+    return {
+        CFG_SPARTN_USE_SOURCE: "CFG-SPARTN-USE_SOURCE",
+        CFG_RATE_MEAS: "CFG-RATE-MEAS",
+        CFG_RATE_NAV: "CFG-RATE-NAV",
+    }.get(key, f"0x{key:08x}")
+
+
+def build_valget(keys, layer: int = 0, position: int = 0) -> bytes:
+    """UBX-CFG-VALGET フレームを生成する。
+
+    layer: 0 = RAM, 1 = BBR, 2 = Flash, 7 = Default
+    """
+    payload = struct.pack("<BBH", 0x00, layer, position)
+    for key in keys:
+        payload += struct.pack("<I", key)
+    return build_frame(UBX_CLASS_CFG, UBX_CFG_VALGET, payload)
+
+
+def parse_valget(payload: bytes):
+    """UBX-CFG-VALGET 応答から (キーID, 値) の一覧を取り出す。"""
+    results = []
+    if len(payload) < 4:
+        return results
+    index = 4  # version, layer, position をスキップ
+    while index + 4 <= len(payload):
+        key = struct.unpack("<I", payload[index:index + 4])[0]
+        index += 4
+        try:
+            size = key_value_size(key)
+        except ValueError:
+            break
+        if index + size > len(payload):
+            break
+        fmt = {1: "<B", 2: "<H", 4: "<I", 8: "<Q"}[size]
+        results.append((key, struct.unpack(fmt, payload[index:index + size])[0]))
+        index += size
+    return results

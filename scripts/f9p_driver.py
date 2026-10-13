@@ -91,6 +91,10 @@ class F9PDriverNode(Node):
         self.declare_parameter('write_timeout_sec', 2.0)
         # この秒数 NMEA が来なければ警告する
         self.declare_parameter('silence_warn_sec', 5.0)
+        # 設定投入後に UBX-CFG-VALGET で実際の値を読み戻して確認する
+        self.declare_parameter('verify_configuration', True)
+        # 測位品質と補正データ流量を定期的に出す間隔 [s] (0 で無効)
+        self.declare_parameter('status_interval_sec', 10.0)
 
         self.serial_port = self.get_parameter('port').get_parameter_value().string_value
         self.serial_baud = self.get_parameter('baud').get_parameter_value().integer_value
@@ -105,6 +109,8 @@ class F9PDriverNode(Node):
                                self.get_parameter('nmea_sentences').get_parameter_value().string_array_value]
         self.write_timeout = self.get_parameter('write_timeout_sec').get_parameter_value().double_value
         self.silence_warn = self.get_parameter('silence_warn_sec').get_parameter_value().double_value
+        self.verify_configuration = self.get_parameter('verify_configuration').get_parameter_value().bool_value
+        self.status_interval = self.get_parameter('status_interval_sec').get_parameter_value().double_value
 
         if self.interface not in ubx.INPROT_KEYS:
             self.get_logger().warn(
@@ -129,6 +135,11 @@ class F9PDriverNode(Node):
         self.rx_buffer = b""
         self.invalid_nmea_count = 0
         self.last_nmea_time = 0.0
+        self.gga_quality = None
+        self.gga_numsv = None
+        self.nmea_count = 0
+        self.last_status_time = 0.0
+        self.status_bytes_mark = 0
 
         self.get_logger().info(
             f"Correction data topic: {self.correction_topic} (interface={self.interface})")
@@ -210,6 +221,14 @@ class F9PDriverNode(Node):
         self.get_logger().info(
             "Configuration sent. Waiting for UBX-ACK-ACK from the receiver...")
 
+        if self.verify_configuration:
+            # 投入した値が実際に効いているかを受信機から読み戻す。
+            # ACK は「キーが存在する」ことしか保証しないため。
+            try:
+                self.gps_serial.write(ubx.build_valget([k for k, _ in key_values]))
+            except serial.SerialTimeoutException:
+                self.get_logger().warn("Timed out while requesting the configuration readback.")
+
     # --- シリアル受信 -------------------------------------------------------
     def read_serial(self):
         """シリアルから読み出し、NMEA センテンスと UBX フレームに分解する。
@@ -268,6 +287,48 @@ class F9PDriverNode(Node):
             self.get_logger().warn("Serial RX buffer overflow. Clearing.")
             self.rx_buffer = b""
 
+    def report_configuration(self, payload: bytes):
+        """読み戻した設定値をログに出す。
+
+        SPARTN 入力が本当に有効になっているかなど、補正が効かないときの
+        切り分けに必要な情報をここで確定させる。
+        """
+        items = ubx.parse_valget(payload)
+        if not items:
+            self.get_logger().warn("Configuration readback returned no items.")
+            return
+
+        self.get_logger().info("Receiver configuration readback:")
+        for key, value in items:
+            name = ubx.key_name(key)
+            note = ""
+            if key == ubx.CFG_SPARTN_USE_SOURCE:
+                note = "  <- 0=IP, 1=L-band"
+            elif name.endswith("INPROT-SPARTN") and value == 0:
+                note = "  <- SPARTN input is DISABLED. Corrections will be ignored."
+            self.get_logger().info(f"  {name} = {value}{note}")
+
+    def report_status(self):
+        """測位品質と補正データの流量を定期的に出す。"""
+        if self.status_interval <= 0.0:
+            return
+        now = time.monotonic()
+        if now - self.last_status_time < self.status_interval:
+            return
+        self.last_status_time = now
+
+        labels = {'0': 'no fix', '1': 'single', '2': 'DGNSS', '4': 'RTK FIXED',
+                  '5': 'RTK float', '6': 'dead reckoning'}
+        quality = self.gga_quality
+        label = labels.get(quality, 'unknown')
+        written = self.correction_bytes_total - self.status_bytes_mark
+        self.status_bytes_mark = self.correction_bytes_total
+
+        self.get_logger().info(
+            f"Status: fix={label}({quality}) sats={self.gga_numsv} "
+            f"nmea={self.nmea_count} corrections={written} B/{self.status_interval:.0f}s "
+            f"(total {self.correction_bytes_total} B)")
+
     def check_receiver_silence(self):
         """受信機から NMEA が来ていないことを可視化する。
 
@@ -310,6 +371,8 @@ class F9PDriverNode(Node):
                 self.get_logger().info(
                     f"UBX-ACK-{'ACK' if msg_id else 'NAK'} for 0x{acked_class:02x}"
                     f" 0x{acked_id:02x}")
+        elif msg_class == ubx.UBX_CLASS_CFG and msg_id == ubx.UBX_CFG_VALGET:
+            self.report_configuration(payload)
         elif self.debug:
             self.get_logger().info(
                 f"UBX message received: class=0x{msg_class:02x} id=0x{msg_id:02x} "
@@ -325,8 +388,14 @@ class F9PDriverNode(Node):
         if self.debug:
             self.get_logger().info(f"Received: {gps_str}")
 
+        self.nmea_count += 1
+
         # GGAセンテンスの処理と発行
         if "GGA" in gps_str:
+            fields = gps_str.split(',')
+            if len(fields) > 7:
+                self.gga_quality = fields[6]
+                self.gga_numsv = fields[7]
             send_data = gps_str
             if "$GNGGA" in gps_str:
                 # NTRIP キャスタ向けに GPGGA へ書き換えてチェックサムを再計算
@@ -401,11 +470,13 @@ class F9PDriverNode(Node):
                 self.send_configuration()
 
             self.last_nmea_time = time.monotonic()
+            self.last_status_time = time.monotonic()
             while rclpy.ok():
                 executor.spin_once(timeout_sec=0.0)
                 self.read_serial()
                 self.write_corrections()
                 self.check_receiver_silence()
+                self.report_status()
 
         except serial.SerialException as ex:
             self.get_logger().error(f"SerialException error: {ex}")
