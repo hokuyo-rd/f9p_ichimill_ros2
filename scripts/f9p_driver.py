@@ -140,6 +140,8 @@ class F9PDriverNode(Node):
         self.nmea_count = 0
         self.last_status_time = 0.0
         self.status_bytes_mark = 0
+        self.valget_pending = False
+        self.valget_sent_time = 0.0
 
         self.get_logger().info(
             f"Correction data topic: {self.correction_topic} (interface={self.interface})")
@@ -226,6 +228,8 @@ class F9PDriverNode(Node):
             # ACK は「キーが存在する」ことしか保証しないため。
             try:
                 self.gps_serial.write(ubx.build_valget([k for k, _ in key_values]))
+                self.valget_pending = True
+                self.valget_sent_time = time.monotonic()
             except serial.SerialTimeoutException:
                 self.get_logger().warn("Timed out while requesting the configuration readback.")
 
@@ -308,6 +312,17 @@ class F9PDriverNode(Node):
                 note = "  <- SPARTN input is DISABLED. Corrections will be ignored."
             self.get_logger().info(f"  {name} = {value}{note}")
 
+    def check_valget_timeout(self):
+        """読み戻しの応答が返ってこないことを可視化する。"""
+        if not self.valget_pending:
+            return
+        if time.monotonic() - self.valget_sent_time < 5.0:
+            return
+        self.valget_pending = False
+        self.get_logger().warn(
+            "No configuration readback from the receiver (UBX-CFG-VALGET). "
+            "Cannot verify whether SPARTN input is enabled.")
+
     def report_status(self):
         """測位品質と補正データの流量を定期的に出す。"""
         if self.status_interval <= 0.0:
@@ -367,11 +382,19 @@ class F9PDriverNode(Node):
                     self.get_logger().error(
                         "Receiver rejected the configuration (UBX-ACK-NAK). "
                         "Check the firmware version and the interface parameter.")
+            elif acked_class == ubx.UBX_CLASS_CFG and acked_id == ubx.UBX_CFG_VALGET:
+                if msg_id == ubx.UBX_ACK_NAK:
+                    # NAK なら読み戻しは返ってこない。黙って待ち続けないよう明示する。
+                    self.valget_pending = False
+                    self.get_logger().warn(
+                        "Receiver rejected the configuration readback (UBX-CFG-VALGET NAK). "
+                        "The readback is diagnostic only; the configuration itself was applied.")
             elif self.debug:
                 self.get_logger().info(
                     f"UBX-ACK-{'ACK' if msg_id else 'NAK'} for 0x{acked_class:02x}"
                     f" 0x{acked_id:02x}")
         elif msg_class == ubx.UBX_CLASS_CFG and msg_id == ubx.UBX_CFG_VALGET:
+            self.valget_pending = False
             self.report_configuration(payload)
         elif self.debug:
             self.get_logger().info(
@@ -476,6 +499,7 @@ class F9PDriverNode(Node):
                 self.read_serial()
                 self.write_corrections()
                 self.check_receiver_silence()
+                self.check_valget_timeout()
                 self.report_status()
 
         except serial.SerialException as ex:
