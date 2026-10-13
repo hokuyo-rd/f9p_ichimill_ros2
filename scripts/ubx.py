@@ -86,6 +86,17 @@ CFG_RATE_NAV = 0x30210002    # U2 測位周期あたりの航法解算出回数
 
 # SPARTN 補正源 (E1) 0 = IP, 1 = L-band
 CFG_SPARTN_USE_SOURCE = 0x20A70001
+
+# アンテナ給電まわり (読み出し専用で確認する)。
+# VOLTCTRL が 0 だとアクティブアンテナへ給電されず、LNA が働かないため
+# 受信レベルが 20 dB 以上落ちる。
+CFG_HW_ANT_KEYS = {
+    0x10A3002E: "CFG-HW-ANT_CFG_VOLTCTRL",
+    0x10A3002F: "CFG-HW-ANT_CFG_SHORTDET",
+    0x10A30031: "CFG-HW-ANT_CFG_OPENDET",
+    0x10A30033: "CFG-HW-ANT_CFG_PWRDOWN",
+    0x10A30035: "CFG-HW-ANT_CFG_RECOVER",
+}
 SPARTN_SOURCE_IP = 0
 SPARTN_SOURCE_LBAND = 1
 
@@ -193,6 +204,8 @@ def key_name(key: int) -> str:
         for iface, k in ports.items():
             if k == key:
                 return f"CFG-MSGOUT-NMEA_ID_{sentence.upper()}_{iface.upper()}"
+    if key in CFG_HW_ANT_KEYS:
+        return CFG_HW_ANT_KEYS[key]
     return {
         CFG_SPARTN_USE_SOURCE: "CFG-SPARTN-USE_SOURCE",
         CFG_RATE_MEAS: "CFG-RATE-MEAS",

@@ -250,6 +250,9 @@ class F9PDriverNode(Node):
             # ACK は「キーが存在する」ことしか保証しないため。
             try:
                 self.gps_serial.write(ubx.build_valget([k for k, _ in key_values]))
+                # アンテナ給電の設定は書き換えず、現在値だけ別要求で読む。
+                # キーIDが FW と合わなくても本体の読み戻しを巻き添えにしない。
+                self.gps_serial.write(ubx.build_valget(list(ubx.CFG_HW_ANT_KEYS)))
                 self.valget_pending = True
                 self.valget_sent_time = time.monotonic()
             except serial.SerialTimeoutException:
@@ -330,6 +333,11 @@ class F9PDriverNode(Node):
             note = ""
             if key == ubx.CFG_SPARTN_USE_SOURCE:
                 note = "  <- 0=IP, 1=L-band"
+            elif key == 0x10A3002E and value == 0:
+                note = ("  <- antenna supply is OFF. An active antenna gets no power, "
+                        "which costs 20+ dB of signal.")
+            elif key == 0x10A3002E:
+                note = "  <- antenna supply is ON"
             elif name.endswith("INPROT-SPARTN") and value == 0:
                 note = "  <- SPARTN input is DISABLED. Corrections will be ignored."
             self.get_logger().info(f"  {name} = {value}{note}")
