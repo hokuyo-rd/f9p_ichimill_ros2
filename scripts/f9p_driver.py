@@ -83,6 +83,8 @@ class F9PDriverNode(Node):
                             checksum = calcultateCheckSum(gga_string)
                             send_data = f"${gga_string}*{checksum}\r\n"
 
+                        # Always terminate GGA, including an original $GPGGA.
+                        send_data = send_data.rstrip('\r\n') + '\r\n'
                         gga_sentence = Sentence()
                         gga_sentence.header.stamp = self.get_clock().now().to_msg()
                         gga_sentence.header.frame_id = 'gps'

@@ -86,3 +86,54 @@ ros2 launch f9p_ichimill gps_ichimill.launch.py
 ```
 ros2 launch f9p_ichimill gps_ntripcaster.launch.py
 ```
+
+## ichimillの自動再接続
+
+`ichimill_connect`はネットワーク処理を専用スレッドで実行し、GGA購読を
+停止させずにRTCMを継続受信します。切断、送受信エラー、一定時間のRTCM
+無受信を検出すると、ソケットを閉じてから新規接続・認証をやり直します。
+起動時に回線が使えない場合も再試行します。
+
+GGAは最新の有効な位置（測位品質が0以外、チェックサム正常）のみを保持し、
+接続成功後および一定間隔で送信します。古いGGA、位置欠落、未測位のGGAは
+送信しません。RTK未成立時の単独測位GGAも利用できます。
+GGAの終端はGPGGA/GNGGAともにCRLFに統一します。
+
+以下は`ichimill_connect`ノードのROSパラメータです。単位は秒で、
+有限の正数を指定します。既存のlaunchを変更せずに使う場合は既定値で動作します。
+調整する場合はlaunchのichimill_connect用parametersに追加してください。
+
+| パラメータ | 既定値 | 内容 |
+| --- | --- | --- |
+| reconnect_interval | 5.0 | 切断・接続失敗後の再試行間隔 |
+| connect_timeout | 10.0 | TCP接続、NTRIP応答ヘッダ受信のタイムアウト |
+| rtcm_timeout | 15.0 | 補正データの無受信を切断と判断する時間 |
+| gga_interval | 1.0 | GGA送信間隔 |
+| gga_max_age | 5.0 | GGAの有効期間 |
+
+NTRIP v1のICY応答とHTTP/1.0・HTTP/1.1の200応答に対応し、
+分割受信や応答ヘッダと同時に届いたRTCMを扱います。
+要求はHTTP/1.0で送信します。Transfer-Encoding付き応答には対応していません。
+
+### 回帰テスト（ROS・実機不要）
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q scripts tests
+```
+
+ROS境界を模擬し、実際の接続処理をローカルTCPサーバで検証します。
+切断・接続リセット・無通信からの再認証、最新GGA送信、RTCM配信再開、
+分割ヘッダとバイナリの保持などを確認します。
+ichimillサービスおよびF9Pによる実機検証は別途必要です。
+
+### 実機での確認
+
+1. 屋外で起動し、RTCM受信とRTK測位を確認します。
+2. GNSS受信機は接続したまま、ネット回線を30秒以上切断します。
+3. 回線を復帰させ、再度`NTRIP authenticated; receiving RTCM`が出ること、
+   `/softbank/rtcm_data`の配信とRTK測位が復帰することを確認します。
+4. 回線なしでの起動、複数回の切断・復帰も確認します。
+
+認証成功ログはRTK FIXの成立を意味しません。RTCM配信は
+`ros2 topic hz /softbank/rtcm_data`、測位状態はGGAの品質値などで確認してください。
